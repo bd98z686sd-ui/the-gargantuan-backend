@@ -1,18 +1,17 @@
-// server.js — The Gargantuan backend
-// Features:
-// - R2 (S3) storage: upload audio, list posts, soft-delete/restore metadata
-// - Spectral video generator (square) with queue + retries
-// - Shorts generator (9x16) using Whisper; includes /api/shorts/jobs + /api/shorts/process-now
-// - Whisper test endpoint
-// - Mock-mode fallback if OPENAI_API_KEY is missing (shorts render without Whisper)
+// server.js — Backend with burned-in captions for Shorts
+// Adds caption burn-in (no libass required) using drawtext overlays per time window.
+// If drawtext isn't available in your ffmpeg build, captions auto-disable gracefully.
 //
-// Env you should set (Render → Environment):
-//   ADMIN_TOKEN, S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_PUBLIC_BASE, S3_FORCE_PATH_STYLE=true
-//   OPENAI_API_KEY=sk-... (for Whisper)
-//   SHORTS_ENABLED=true
-//   FFMPEG_LOG=1 (optional)
-//   VIDEO_* (optional: see .env.example)
-
+// New env:
+//   CAPTIONS_ENABLED=true          # enable caption burn-in for Shorts
+//   CAPTION_MAX_LINE_CHARS=42      # wrap width per line
+//   CAPTION_FONT_SIZE=48           # px
+//   CAPTION_BOX_OPACITY=0.6        # 0..1
+//   CAPTION_COLOR=white            # text color
+//   CAPTION_BOXCOLOR=black         # box color behind text
+//
+// Existing env: see .env.example
+//
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -25,7 +24,6 @@ import OpenAI from 'openai'
 import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3'
 import { Readable } from 'node:stream'
 
-// ------------ logging -------------
 const FFMPEG_LOG = String(process.env.FFMPEG_LOG || '').trim() === '1';
 function log(...args){ console.log('[gargantuan]', ...args) }
 function logErr(...args){ console.error('[gargantuan]', ...args) }
@@ -34,7 +32,6 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// ------------ admin auth -------------
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return next()
@@ -43,7 +40,7 @@ function requireAdmin(req, res, next) {
   next()
 }
 
-// ------------ R2 / S3 -------------
+// -------- R2 / S3 --------
 const S3_ENDPOINT = process.env.S3_ENDPOINT
 const S3_REGION = process.env.S3_REGION || 'auto'
 const S3_BUCKET = process.env.S3_BUCKET
@@ -100,7 +97,7 @@ async function s3List(prefix) {
   return out
 }
 
-// ------------ meta -------------
+// -------- Meta --------
 const META_KEY = 'meta/_posts.json'
 async function readMeta() {
   const txt = await s3GetText(META_KEY)
@@ -112,16 +109,15 @@ async function writeMeta(m) {
   await s3UploadBuffer(META_KEY, buf, 'application/json')
 }
 
-// ------------ health -------------
+// -------- Health --------
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// ------------ upload -------------
+// -------- Upload --------
 const upload = multer({ storage: multer.memoryStorage() })
 app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
     const safe = (req.file.originalname || 'audio.mp3').replace(/\s+/g, '-')
-    // accept audio or video; we don't assume extension here
     const folder = (req.file.mimetype || '').startsWith('video/') ? 'video' : 'audio'
     const key = `${folder}/${Date.now()}-${safe}`
     await s3UploadBuffer(key, req.file.buffer, req.file.mimetype || 'application/octet-stream')
@@ -132,7 +128,7 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) =
   }
 })
 
-// ------------ meta edit & hide -------------
+// -------- Meta edit/hide --------
 app.post('/api/meta', requireAdmin, async (req, res) => {
   try {
     const { filename, title, tagline } = req.body || {}
@@ -166,7 +162,7 @@ app.post('/api/restore', requireAdmin, async (req, res) => {
   } catch (e) { logErr('restore error', e); res.status(500).json({ error: 'restore failed' }) }
 })
 
-// ------------ posts feed -------------
+// -------- Posts feed --------
 app.get('/api/posts', async (_req, res) => {
   try {
     const [vids, auds, meta] = await Promise.all([ s3List('video/'), s3List('audio/'), readMeta() ])
@@ -201,12 +197,12 @@ app.get('/api/posts', async (_req, res) => {
   } catch (e) { logErr('list error', e); res.status(500).json({ error: 'list failed' }) }
 })
 
-// ------------ video (square) render -------------
+// -------- Square video render (unchanged) --------
 const VIDEO_MAX_SECONDS = Number(process.env.VIDEO_MAX_SECONDS || 0) // 0 = full length
 const CANVAS_W = Number(process.env.VIDEO_W || 720)
 const CANVAS_H = Number(process.env.VIDEO_H || 720)
 const SPECTRUM_H = Number(process.env.VIDEO_SPECTRUM_H || 540)
-const TOPBAR_H  = Number(process.env.VIDEO_TOPBAR_H || 100) // masthead height
+const TOPBAR_H  = Number(process.env.VIDEO_TOPBAR_H || 100)
 const FPS = Number(process.env.VIDEO_FPS || 24)
 const PRESET = String(process.env.VIDEO_PRESET || 'ultrafast')
 const CRF = String(process.env.VIDEO_CRF || '28')
@@ -219,18 +215,13 @@ async function renderSpectralVideo(sourceKey){
   await new Promise((resolve, reject) => {
     const opts = ['-y','-nostdin','-threads','1','-preset', PRESET, '-r', String(FPS)]
     if (VIDEO_MAX_SECONDS > 0) { opts.push('-t', String(VIDEO_MAX_SECONDS)) }
-
     const filter = [
       `color=c=white:size=${CANVAS_W}x${CANVAS_H}:rate=${FPS}[bg]`,
       `[0:a]aformat=channel_layouts=stereo,showspectrum=s=${CANVAS_W}x${SPECTRUM_H}:mode=combined:scale=log:color=intensity,format=yuv420p[v1]`,
       `[bg][v1]overlay=shortest=1:x=0:y=${CANVAS_H - SPECTRUM_H},drawbox=x=0:y=0:w=${CANVAS_W}:h=${TOPBAR_H}:color=#052962@1:t=fill[v]`
     ]
-
-    const cmd = ffmpeg(tmpIn)
-      .inputOption('-nostdin')
-      .outputOptions(opts)
-      .complexFilter(filter)
-      .outputOptions(['-map','[v]','-map','0:a','-shortest','-crf', CRF])
+    const cmd = ffmpeg(tmpIn).inputOption('-nostdin').outputOptions(opts)
+      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest','-crf', CRF])
       .videoCodec('libx264').audioCodec('aac')
       .on('start', (cmdline)=>log('ffmpeg(sq) start:', cmdline))
       .on('stderr', (line)=>{ if(FFMPEG_LOG) log('ffmpeg(sq):', line) })
@@ -247,19 +238,11 @@ async function renderSpectralVideo(sourceKey){
   return outKey
 }
 
-// ------------ durable video queue -------------
+// -------- Video queue --------
 function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36) }
 const VIDEO_JOBS_KEY = 'meta/_video_jobs.json'
-async function readVideoJobs(){
-  const txt = await s3GetText(VIDEO_JOBS_KEY)
-  if(!txt) return { queue: [], items: {} }
-  try { return JSON.parse(txt) } catch { return { queue: [], items: {} } }
-}
-async function writeVideoJobs(j){
-  const buf = Buffer.from(JSON.stringify(j, null, 2))
-  await s3UploadBuffer(VIDEO_JOBS_KEY, buf, 'application/json')
-}
-
+async function readVideoJobs(){ const t = await s3GetText(VIDEO_JOBS_KEY); if(!t) return {queue:[],items:{}}; try{ return JSON.parse(t)}catch{return{queue:[],items:{}}} }
+async function writeVideoJobs(j){ await s3UploadBuffer(VIDEO_JOBS_KEY, Buffer.from(JSON.stringify(j,null,2)), 'application/json') }
 const MAX_RETRIES = 3
 function backoffMs(attempt){ return Math.min(60000, 2000 * Math.pow(2, attempt)) }
 
@@ -273,67 +256,36 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     jobs.queue.push(id)
     await writeVideoJobs(jobs)
     res.json({ ok:true, id, status:'queued' })
-  }catch(e){
-    logErr('generate enqueue error', e)
-    res.status(500).json({ error: 'enqueue failed' })
-  }
+  }catch(e){ logErr('enqueue error', e); res.status(500).json({ error: 'enqueue failed' }) }
 })
 
 app.get('/api/video/:id/status', async (req, res) => {
-  try{
-    const jobs = await readVideoJobs()
-    const j = jobs.items[req.params.id]
-    if(!j) return res.status(404).json({ error: 'not found' })
-    res.json(j)
-  }catch(e){
-    res.status(500).json({ error: 'status failed' })
-  }
+  try{ const jobs = await readVideoJobs(); const j = jobs.items[req.params.id]; if(!j) return res.status(404).json({error:'not found'}); res.json(j) }
+  catch{ res.status(500).json({ error: 'status failed' }) }
 })
 
 app.get('/api/video/jobs', async (_req, res) => {
-  try { const jobs = await readVideoJobs(); res.json(jobs) }
-  catch(e){ logErr('jobs debug error', e); res.status(500).json({ error: 'debug failed' }) }
+  try { const jobs = await readVideoJobs(); res.json(jobs) } catch { res.status(500).json({ error: 'debug failed' }) }
 })
 
 app.post('/api/video/process-now', requireAdmin, async (req, res) => {
   try {
     const { id } = req.query;
     if (!id) return res.status(400).json({ error: 'id required' })
-
-    const jobs = await readVideoJobs();
-    const job = jobs.items[id];
-    if (!job) return res.status(404).json({ error: 'job not found' })
-
-    log('manual process start', id, job.filename);
-    job.status = 'processing';
-    await writeVideoJobs(jobs);
-
+    const jobs = await readVideoJobs(); const job = jobs.items[id]; if (!job) return res.status(404).json({ error: 'job not found' })
+    job.status = 'processing'; await writeVideoJobs(jobs)
     try {
       const outKey = await renderSpectralVideo(job.filename);
-      job.status = 'done';
-      job.output = outKey;
-      await writeVideoJobs(jobs);
-      log('manual process done', id, outKey);
+      job.status = 'done'; job.output = outKey; await writeVideoJobs(jobs);
       return res.json({ ok: true, id, output: outKey, url: publicUrlForKey(outKey) });
     } catch (e) {
       job.attempts = (job.attempts || 0) + 1;
-      if (job.attempts >= MAX_RETRIES) {
-        job.status = 'error'; job.error = String(e);
-        const idx = (jobs.queue || []).indexOf(id);
-        if (idx >= 0) jobs.queue.splice(idx, 1);
-      } else {
-        job.status = 'retry';
-        job.error = String(e);
-        job.nextTryAt = Date.now() + backoffMs(job.attempts);
-      }
+      if (job.attempts >= MAX_RETRIES) { job.status = 'error'; job.error = String(e); jobs.queue = jobs.queue.filter(x=>x!==id) }
+      else { job.status = 'retry'; job.error = String(e); job.nextTryAt = Date.now() + backoffMs(job.attempts) }
       await writeVideoJobs(jobs);
-      logErr('manual process failed', id, e);
       return res.status(500).json({ error: 'ffmpeg failed', details: String(e) });
     }
-  } catch (e) {
-    logErr('manual process endpoint error', e);
-    res.status(500).json({ error: 'process-now failed' });
-  }
+  } catch (e) { res.status(500).json({ error: 'process-now failed' }) }
 })
 
 async function processVideoOnce(){
@@ -343,36 +295,23 @@ async function processVideoOnce(){
     const j = jobs.items[id]; return j && (j.status==='queued' || j.status==='retry') && (j.nextTryAt||0) <= now
   })
   if (idx === -1) return
-  const id = jobs.queue[idx]
-  const job = jobs.items[id]
-  log('video worker picked', id, job.filename)
+  const id = jobs.queue[idx]; const job = jobs.items[id]
   job.status = 'processing'; await writeVideoJobs(jobs)
-  try{
-    const outKey = await renderSpectralVideo(job.filename)
-    job.status = 'done'; job.output = outKey; await writeVideoJobs(jobs)
-    jobs.queue.splice(idx,1); await writeVideoJobs(jobs)
-    log('video worker done', id, outKey)
-  }catch(e){
-    logErr('video worker error', e)
-    job.attempts = (job.attempts||0) + 1
-    if (job.attempts >= MAX_RETRIES){
-      job.status = 'error'; job.error = String(e)
-      jobs.queue.splice(idx,1)
-    } else {
-      job.status = 'retry'
-      job.error = String(e)
-      job.nextTryAt = Date.now() + backoffMs(job.attempts)
-    }
-    await writeVideoJobs(jobs)
-  }
+  try{ const outKey = await renderSpectralVideo(job.filename); job.status='done'; job.output=outKey; jobs.queue.splice(idx,1); await writeVideoJobs(jobs) }
+  catch(e){ job.attempts=(job.attempts||0)+1; if(job.attempts>=MAX_RETRIES){job.status='error'; jobs.queue.splice(idx,1)}else{job.status='retry'; job.nextTryAt=Date.now()+backoffMs(job.attempts)} job.error=String(e); await writeVideoJobs(jobs) }
 }
 setInterval(processVideoOnce, 5000)
-setInterval(() => log('video worker heartbeat'), 10000)
 
-// ------------ shorts + Whisper -------------
+// -------- Shorts + Captions --------
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
 const JOBS_KEY = 'meta/_shorts_jobs.json'
+const CAPTIONS_ENABLED = String(process.env.CAPTIONS_ENABLED || 'true').toLowerCase() === 'true'
+const CAPTION_MAX_LINE_CHARS = Number(process.env.CAPTION_MAX_LINE_CHARS || 42)
+const CAPTION_FONT_SIZE = Number(process.env.CAPTION_FONT_SIZE || 48)
+const CAPTION_BOX_OPACITY = Number(process.env.CAPTION_BOX_OPACITY || 0.6)
+const CAPTION_COLOR = String(process.env.CAPTION_COLOR || 'white')
+const CAPTION_BOXCOLOR = String(process.env.CAPTION_BOXCOLOR || 'black')
 
 async function readJobs() {
   const txt = await s3GetText(JOBS_KEY)
@@ -416,11 +355,10 @@ app.get('/api/shorts', async (_req, res) => {
   res.json(done.map(j => ({ id:j.id, source:j.filename, output:j.output, url: j.output ? publicUrlForKey(j.output) : null, createdAt:j.createdAt })))
 })
 
-// --- Whisper helper (mock-mode if OPENAI_API_KEY missing) ---
 async function transcribeWhisperOrMock(tmpAudioPath){
   if (!openai) {
     log('[shorts] OPENAI_API_KEY missing → mock transcription mode')
-    return { text: '(mock) transcription disabled', segments: [{ start: 0, end: 30 }] }
+    return { text: '(mock) transcription disabled', segments: [{ start: 0, end: 30, text: '(mock)'}] }
   }
   const resp = await openai.audio.transcriptions.create({
     file: fs.createReadStream(tmpAudioPath),
@@ -431,43 +369,103 @@ async function transcribeWhisperOrMock(tmpAudioPath){
   return resp
 }
 
-function pickSegment(tr, maxSeconds){
-  try{
-    const segs = tr.segments || []
-    if (segs.length){
-      const start = Math.max(0, Math.floor(segs[0].start||0))
-      const end = Math.min(Math.ceil(segs[0].start + maxSeconds), Math.ceil(segs[segs.length-1].end || (start+maxSeconds)))
-      return { start, duration: Math.max(5, Math.min(maxSeconds, end-start)) }
+// Merge short Whisper segments into readable lines
+function mergeSegments(segments, maxChars) {
+  const out = []
+  let buf = ''
+  let start = segments.length ? segments[0].start : 0
+  for (const s of segments) {
+    const chunk = (s.text || '').trim()
+    if (!chunk) continue
+    const tryAdd = (buf ? buf + ' ' : '') + chunk
+    if (tryAdd.length > maxChars && buf) {
+      out.push({ start, end: s.start, text: buf.trim() })
+      buf = chunk
+      start = s.start
+    } else {
+      buf = tryAdd
     }
-  }catch{}
-  return { start: 0, duration: Math.max(5, maxSeconds) }
+  }
+  if (buf) out.push({ start, end: segments.length ? segments[segments.length-1].end : start + 3, text: buf.trim() })
+  return out
 }
 
-// --- Shorts renderer ---
+function escDrawtext(s) {
+  return (s || '')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, ' ')
+}
+
 async function renderShortFromS3(sourceKey, maxSeconds){
   const tmpIn = path.join(os.tmpdir(), `short-in-${Date.now()}.media`)
   const tmpOut = path.join(os.tmpdir(), `short-out-${Date.now()}.mp4`)
   await s3GetToFile(sourceKey, tmpIn)
   const tr = await transcribeWhisperOrMock(tmpIn)
-  const seg = pickSegment(tr, maxSeconds||45)
+  // Build caption lines
+  const segs = (tr.segments || []).map(s => ({ start: Math.max(0, s.start||0), end: Math.max(s.end||((s.start||0)+1)), text: s.text||'' }))
+  const lines = mergeSegments(segs, CAPTION_MAX_LINE_CHARS)
+
+  // Choose time window
+  const totalEnd = segs.length ? segs[segs.length-1].end : 60
+  const clipDur = Math.min(maxSeconds||45, Math.max(5, Math.ceil(totalEnd)))
+  const clipStart = Math.max(0, segs.length ? Math.floor(segs[0].start) : 0)
+
+  ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
   await new Promise((resolve, reject) => {
-    ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
-    const filter = [
+    const baseFilters = [
       `color=c=white:size=1080x1920:rate=30[bg]`,
-      `[0:a]atrim=${seg.start}:${seg.start+seg.duration},asetpts=N/SR/TB,asplit=2[a1][a2]`,
+      `[0:a]atrim=${clipStart}:${clipStart+clipDur},asetpts=N/SR/TB,asplit=2[a1][a2]`,
       `[a1]showspectrum=s=1080x1200:mode=combined:color=intensity:scale=log,format=yuv420p[v1]`,
-      `[bg][v1]overlay=shortest=1:x=0:y=360,drawbox=x=0:y=0:w=1080:h=180:color=#052962@1:t=fill[v]`
+      `[bg][v1]overlay=shortest=1:x=0:y=360,drawbox=x=0:y=0:w=1080:h=180:color=#052962@1:t=fill[vbase]`
     ]
+
+    let chain = 'vbase'
+    let filters = baseFilters.slice()
+
+    if (CAPTIONS_ENABLED && lines.length) {
+      for (const ln of lines) {
+        const start = Math.max(clipStart, ln.start)
+        const end   = Math.min(clipStart + clipDur, ln.end || (start+2))
+        if (end <= clipStart || start >= clipStart + clipDur) continue
+        const enable = `between(t\,${(start-clipStart).toFixed(2)}\,${(end-clipStart).toFixed(2)})`
+        // Centered near bottom (above spectrum): y ~ 1500
+        const draw = [
+          `${chain}`,
+          `drawtext=text='${escDrawtext(ln.text)}':fontsize=${CAPTION_FONT_SIZE}:fontcolor=${CAPTION_COLOR}:x=(w-text_w)/2:y=1500:box=1:boxcolor=${CAPTION_BOXCOLOR}@${CAPTION_BOX_OPACITY}:boxborderw=20:enable='${enable}'[${chain}c]`
+        ].join(';')
+        filters.push(draw)
+        chain = `${chain}c`
+      }
+    }
+
     const cmd = ffmpeg(tmpIn)
       .inputOption('-nostdin')
-      .outputOptions(['-y','-nostdin','-threads','1','-preset','veryfast','-t', String(seg.duration),'-r','30','-crf','28'])
-      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest']).videoCodec('libx264').audioCodec('aac')
-      .on('start', (cmdline)=>log('ffmpeg(short) start:', cmdline))
-      .on('stderr', (line)=>{ if(FFMPEG_LOG) log('ffmpeg(short):', line) })
-      .on('end', ()=>{ log('ffmpeg(short) done'); resolve() })
-      .on('error', (e)=>{ logErr('ffmpeg(short) error', e); reject(e) })
+      .outputOptions(['-y','-nostdin','-threads','1','-preset','veryfast','-t', String(clipDur),'-r','30','-crf','28'])
+      .complexFilter(filters)
+      .outputOptions(['-map',`[${chain}]`,'-map','0:a','-shortest'])
+      .videoCodec('libx264').audioCodec('aac')
+      .on('start', (cmdline)=>log('ffmpeg(short+captions) start:', cmdline))
+      .on('stderr', (line)=>{ if(FFMPEG_LOG) log('ffmpeg(short+captions):', line) })
+      .on('end', ()=>{ log('ffmpeg(short+captions) done'); resolve() })
+      .on('error', (e)=>{
+        logErr('ffmpeg(short+captions) error — proceeding without captions', e)
+        // Fallback: re-run without captions
+        const fallback = ffmpeg(tmpIn)
+          .inputOption('-nostdin')
+          .outputOptions(['-y','-nostdin','-threads','1','-preset','veryfast','-t', String(clipDur),'-r','30','-crf','28'])
+          .complexFilter(baseFilters)
+          .outputOptions(['-map','[vbase]','-map','0:a','-shortest'])
+          .videoCodec('libx264').audioCodec('aac')
+          .on('end', ()=>resolve())
+          .on('error', (ee)=>reject(ee))
+          .save(tmpOut)
+        if(FFMPEG_LOG) fallback.addOption('-loglevel','verbose')
+      })
       .save(tmpOut)
+    if(FFMPEG_LOG) cmd.addOption('-loglevel','verbose')
   })
+
   const base = path.basename(sourceKey).replace(/\.[^/.]+$/, '')
   const outKey = `shorts/${base}-9x16.mp4`
   const outBuf = fs.readFileSync(tmpOut)
@@ -476,7 +474,47 @@ async function renderShortFromS3(sourceKey, maxSeconds){
   return outKey
 }
 
-// --- Shorts worker loop ---
+async function readJobs() {
+  const txt = await s3GetText(JOBS_KEY)
+  if (!txt) return { queue: [], items: {} }
+  try { return JSON.parse(txt) } catch { return { queue: [], items: {} } }
+}
+async function writeJobs(j) {
+  const buf = Buffer.from(JSON.stringify(j, null, 2))
+  await s3UploadBuffer(JOBS_KEY, buf, 'application/json')
+}
+
+// request/status/list
+app.post('/api/shorts/request', requireAdmin, async (req, res) => {
+  try{
+    if (String(process.env.SHORTS_ENABLED).toLowerCase() !== 'true') {
+      return res.status(400).json({ error: 'Shorts disabled (set SHORTS_ENABLED=true)' })
+    }
+    const { filename, maxSeconds } = req.body || {}
+    if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
+    const id = uid()
+    const jobs = await readJobs()
+    jobs.items[id] = { id, filename, maxSeconds: Number(maxSeconds)||Number(process.env.SHORTS_MAX_SECONDS||45), status: 'queued', createdAt: Date.now() }
+    jobs.queue.push(id)
+    await writeJobs(jobs)
+    res.json({ ok:true, id, status:'queued' })
+  }catch(e){ logErr('shorts request error', e); res.status(500).json({ error: 'request failed' }) }
+})
+
+app.get('/api/shorts/:id/status', async (req, res) => {
+  const jobs = await readJobs()
+  const job = jobs.items[req.params.id]
+  if (!job) return res.status(404).json({ error: 'not found' })
+  res.json(job)
+})
+
+app.get('/api/shorts', async (_req, res) => {
+  const jobs = await readJobs()
+  const done = Object.values(jobs.items).filter(j => j.status === 'done').sort((a,b)=>b.createdAt-a.createdAt)
+  res.json(done.map(j => ({ id:j.id, source:j.filename, output:j.output, url: j.output ? publicUrlForKey(j.output) : null, createdAt:j.createdAt })))
+})
+
+// worker loop
 async function workerOnce(){
   const jobs = await readJobs()
   const next = jobs.queue.shift()
@@ -493,16 +531,14 @@ async function workerOnce(){
 }
 setInterval(workerOnce, 8000)
 
-// --- Whisper test endpoint ---
+// whisper test
 app.post('/api/whisper-test', requireAdmin, async (req, res) => {
   try {
     const { filename } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
     const tmpIn = path.join(os.tmpdir(), `whisper-${Date.now()}.media`)
     await s3GetToFile(filename, tmpIn)
-    if (!openai) {
-      return res.json({ ok: true, text: '(mock) transcription disabled', language: 'unknown' })
-    }
+    if (!openai) return res.json({ ok: true, text: '(mock) transcription disabled', language: 'unknown' })
     const resp = await openai.audio.transcriptions.create({
       file: fs.createReadStream(tmpIn),
       model: 'whisper-1',
@@ -517,46 +553,31 @@ app.post('/api/whisper-test', requireAdmin, async (req, res) => {
   }
 })
 
-// --- Shorts debug helpers ---
+// debug: jobs/process-now for shorts
 app.get('/api/shorts/jobs', async (_req, res) => {
-  try {
-    const jobs = await readJobs();
-    res.json(jobs);
-  } catch (e) {
-    console.error('shorts jobs debug error', e);
-    res.status(500).json({ error: 'debug failed' });
-  }
-});
+  try { const jobs = await readJobs(); res.json(jobs) }
+  catch(e){ res.status(500).json({ error: 'debug failed' }) }
+})
 
 app.post('/api/shorts/process-now', requireAdmin, async (req, res) => {
   try {
     const { id } = req.query;
-    if (!id) return res.status(400).json({ error: 'id required' });
-
-    const jobs = await readJobs();
-    const job = jobs.items[id];
-    if (!job) return res.status(404).json({ error: 'job not found' });
-
-    job.status = 'processing';
-    await writeJobs(jobs);
-
+    if (!id) return res.status(400).json({ error: 'id required' })
+    const jobs = await readJobs(); const job = jobs.items[id]; if (!job) return res.status(404).json({ error: 'job not found' })
+    job.status='processing'; await writeJobs(jobs)
     try {
-      const outKey = await renderShortFromS3(job.filename, job.maxSeconds);
-      job.status = 'done';
-      job.output = outKey;
-      await writeJobs(jobs);
-      return res.json({ ok: true, id, output: outKey, url: publicUrlForKey(outKey) });
+      const outKey = await renderShortFromS3(job.filename, job.maxSeconds)
+      job.status='done'; job.output=outKey; await writeJobs(jobs)
+      res.json({ ok:true, id, output: outKey, url: publicUrlForKey(outKey) })
     } catch (e) {
-      job.status = 'error';
-      job.error = String(e);
-      await writeJobs(jobs);
-      return res.status(500).json({ error: 'ffmpeg/whisper failed', details: String(e) });
+      job.status='error'; job.error=String(e); await writeJobs(jobs)
+      res.status(500).json({ error: 'ffmpeg/whisper failed', details: String(e) })
     }
-  } catch (e) {
-    console.error('shorts process-now endpoint error', e);
-    res.status(500).json({ error: 'process-now failed' });
-  }
-});
+  } catch { res.status(500).json({ error: 'process-now failed' }) }
+})
+
+// util
+function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36) }
 
 const PORT = process.env.PORT || 10000
 app.listen(PORT, () => console.log('Backend listening on', PORT))
