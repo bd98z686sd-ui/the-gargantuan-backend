@@ -11,7 +11,9 @@ app.use(cors())
 app.use(express.json())
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads')
+const TRASH_DIR = path.join(UPLOAD_DIR, '.trash')
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
+if (!fs.existsSync(TRASH_DIR)) fs.mkdirSync(TRASH_DIR, { recursive: true })
 app.use('/uploads', express.static(UPLOAD_DIR))
 
 const storage = multer.diskStorage({
@@ -40,46 +42,56 @@ function writeMeta(meta) {
   fs.writeFileSync(META_PATH, JSON.stringify(meta, null, 2))
 }
 
+function baseUrl(req){
+  return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
+}
+
+function listFromDir(dir, req){
+  const meta = readMeta()
+  return fs.readdirSync(dir)
+    .filter(f => f.endsWith('.mp3') || f.endsWith('.mp4'))
+    .map(filename => {
+      const full = path.join(dir, filename)
+      const stat = fs.statSync(full)
+      const baseName = filename.replace(/\.[^/.]+$/, '')
+      const title = meta[baseName]?.title || baseName
+      const isTrash = dir === TRASH_DIR
+      return {
+        filename,
+        title,
+        url: `/uploads/${isTrash ? '.trash/' : ''}${filename}`,
+        absoluteUrl: `${baseUrl(req)}/uploads/${isTrash ? '.trash/' : ''}${filename}`,
+        type: filename.endsWith('.mp4') ? 'video' : 'audio',
+        date: stat.mtime.toISOString()
+      }
+    })
+    .sort((a, b) => new Date(b.date) - new Date(a.date))
+}
+
+function moveFile(from, to){
+  fs.renameSync(from, to)
+}
+
+// --- Health ---
 app.get('/', (_req, res) => res.send('The Gargantuan backend is live.'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --- List posts with metadata ---
+// --- Lists ---
 app.get('/api/posts', (req, res) => {
-  try {
-    const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
-    const meta = readMeta()
-    const items = fs.readdirSync(UPLOAD_DIR)
-      .filter(f => f.endsWith('.mp3') || f.endsWith('.mp4'))
-      .map(filename => {
-        const full = path.join(UPLOAD_DIR, filename)
-        const stat = fs.statSync(full)
-        const baseName = filename.replace(/\.[^/.]+$/, '')
-        const title = meta[baseName]?.title || baseName
-        return {
-          filename,
-          title,
-          url: `/uploads/${filename}`,
-          absoluteUrl: `${base}/uploads/${filename}`,
-          type: filename.endsWith('.mp4') ? 'video' : 'audio',
-          date: stat.mtime.toISOString()
-        }
-      })
-      .sort((a, b) => new Date(b.date) - new Date(a.date))
-    res.json(items)
-  } catch (e) {
-    console.error('posts error', e)
-    res.status(500).json({ error: 'Could not list uploads' })
-  }
+  try { res.json(listFromDir(UPLOAD_DIR, req)) }
+  catch (e) { console.error(e); res.status(500).json({ error: 'Could not list uploads' }) }
+})
+app.get('/api/trash', requireAdmin, (req, res) => {
+  try { res.json(listFromDir(TRASH_DIR, req)) }
+  catch (e) { console.error(e); res.status(500).json({ error: 'Could not list trash' }) }
 })
 
-// --- Upload audio ---
+// --- Upload & generate ---
 app.post('/api/upload', requireAdmin, upload.single('audio'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
-  const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
-  res.json({ filename: req.file.filename, title: req.file.originalname, url: `/uploads/${req.file.filename}`, absoluteUrl: `${base}/uploads/${req.file.filename}` })
+  res.json({ filename: req.file.filename, title: req.file.originalname, url: `/uploads/${req.file.filename}`, absoluteUrl: `${baseUrl(req)}/uploads/${req.file.filename}` })
 })
 
-// --- Generate video ---
 app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try {
     const { filename, title = 'The Gargantuan' } = req.body || {}
@@ -96,14 +108,8 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
       .videoCodec('libx264')
       .audioCodec('aac')
       .output(outPath)
-      .on('end', () => {
-        const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
-        res.json({ output: `/uploads/${outName}`, absoluteUrl: `${base}/uploads/${outName}` })
-      })
-      .on('error', (err) => {
-        console.error('ffmpeg error', err)
-        res.status(500).json({ error: 'ffmpeg failed', details: String(err) })
-      })
+      .on('end', () => res.json({ output: `/uploads/${outName}`, absoluteUrl: `${baseUrl(req)}/uploads/${outName}` }))
+      .on('error', (err) => { console.error('ffmpeg error', err); res.status(500).json({ error: 'ffmpeg failed', details: String(err) }) })
       .run()
   } catch (err) {
     console.error('generate error', err)
@@ -111,7 +117,7 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
   }
 })
 
-// --- Edit post title ---
+// --- Edit title ---
 app.patch('/api/posts/:id', requireAdmin, (req, res) => {
   try {
     const id = req.params.id
@@ -130,24 +136,112 @@ app.patch('/api/posts/:id', requireAdmin, (req, res) => {
   }
 })
 
-// --- Delete post ---
+// --- Soft delete to .trash ---
 app.delete('/api/posts/:id', requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id
+    const baseName = id.replace(/\.[^/.]+$/, '')
+    const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+    let moved = []
+    for (const f of candidates) {
+      const src = path.join(UPLOAD_DIR, f)
+      const dst = path.join(TRASH_DIR, f)
+      if (fs.existsSync(src)) { moveFile(src, dst); moved.push(f) }
+    }
+    if (moved.length === 0) return res.status(404).json({ error: 'not found' })
+    res.json({ ok: true, moved })
+  } catch (e) {
+    console.error('soft delete error', e)
+    res.status(500).json({ error: 'delete failed' })
+  }
+})
+
+// --- Restore from trash ---
+app.post('/api/posts/:id/restore', requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id
+    const baseName = id.replace(/\.[^/.]+$/, '')
+    const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+    let restored = []
+    for (const f of candidates) {
+      const src = path.join(TRASH_DIR, f)
+      const dst = path.join(UPLOAD_DIR, f)
+      if (fs.existsSync(src)) { moveFile(src, dst); restored.push(f) }
+    }
+    if (restored.length === 0) return res.status(404).json({ error: 'not found in trash' })
+    res.json({ ok: true, restored })
+  } catch (e) {
+    console.error('restore error', e)
+    res.status(500).json({ error: 'restore failed' })
+  }
+})
+
+// --- Hard delete from trash ---
+app.delete('/api/trash/:id', requireAdmin, (req, res) => {
   try {
     const id = req.params.id
     const baseName = id.replace(/\.[^/.]+$/, '')
     const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
     let removed = []
     for (const f of candidates) {
-      const p = path.join(UPLOAD_DIR, f)
+      const p = path.join(TRASH_DIR, f)
       if (fs.existsSync(p)) { fs.unlinkSync(p); removed.push(f) }
     }
+    // optionally also remove metadata
     const meta = readMeta()
     if (meta[baseName]) { delete meta[baseName]; writeMeta(meta) }
-    if (removed.length === 0) return res.status(404).json({ error: 'not found' })
+    if (removed.length === 0) return res.status(404).json({ error: 'not found in trash' })
     res.json({ ok: true, removed })
   } catch (e) {
-    console.error('delete error', e)
-    res.status(500).json({ error: 'delete failed' })
+    console.error('hard delete error', e)
+    res.status(500).json({ error: 'hard delete failed' })
+  }
+})
+
+// --- Bulk operations ---
+app.post('/api/posts/bulk-delete', requireAdmin, (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : []
+    if (!ids.length) return res.status(400).json({ error: 'ids required' })
+    let results = []
+    for (const id of ids) {
+      const baseName = id.replace(/\.[^/.]+$/, '')
+      const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+      let moved = []
+      for (const f of candidates) {
+        const src = path.join(UPLOAD_DIR, f)
+        const dst = path.join(TRASH_DIR, f)
+        if (fs.existsSync(src)) { moveFile(src, dst); moved.push(f) }
+      }
+      results.push({ id: baseName, moved })
+    }
+    res.json({ ok: true, results })
+  } catch (e) {
+    console.error('bulk delete error', e)
+    res.status(500).json({ error: 'bulk delete failed' })
+  }
+})
+
+app.post('/api/trash/bulk-restore', requireAdmin, (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : []
+    if (!ids.length) return res.status(400).json({ error: 'ids required' })
+    let results = []
+    for (const id of ids) {
+      const baseName = id.replace(/\.[^/.]+$/, '')
+      const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+      let restored = []
+      for (const f of candidates) {
+        const src = path.join(TRASH_DIR, f)
+        const dst = path.join(UPLOAD_DIR, f)
+        if (fs.existsSync(src)) { moveFile(src, dst); restored.push(f) }
+      }
+      results.push({ id: baseName, restored })
+    }
+    res.json({ ok: true, results })
+  } catch (e) {
+    console.error('bulk restore error', e)
+    res.status(500).json({ error: 'bulk restore failed' })
   }
 })
 

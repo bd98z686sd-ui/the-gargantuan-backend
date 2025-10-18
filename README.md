@@ -1,12 +1,17 @@
-# The Gargantuan — Backend (with Edit/Delete)
-This backend includes:
-- Metadata for titles in `uploads/_meta.json`
-- Protected edit and delete endpoints
-- All upload/generate features with `ADMIN_TOKEN` auth
+# The Gargantuan — Backend (Soft Delete + Bulk)
+- Soft delete moves items to `uploads/.trash`
+- Restore single or bulk from trash
+- Hard delete from trash
+- Bulk delete from posts
 
-## Endpoints
-- GET /api/posts — lists posts
-- POST /api/upload — upload audio (auth required)
-- POST /api/generate-video — generate mp4 (auth required)
-- PATCH /api/posts/:id — edit title (auth required)
-- DELETE /api/posts/:id — delete post (auth required)
+## Endpoints (all protected by ADMIN_TOKEN except GET lists)
+GET  /api/posts
+GET  /api/trash
+POST /api/upload
+POST /api/generate-video
+PATCH /api/posts/:id
+DELETE /api/posts/:id                (soft delete)
+POST /api/posts/:id/restore          (restore one)
+DELETE /api/trash/:id                (hard delete one)
+POST /api/posts/bulk-delete          { ids: [baseName|filename, ...] }
+POST /api/trash/bulk-restore         { ids: [baseName|filename, ...] }
