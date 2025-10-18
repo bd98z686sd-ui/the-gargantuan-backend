@@ -22,6 +22,7 @@ function requireAdmin(req, res, next) {
   next()
 }
 
+// ==== R2 / S3 CONFIG ====
 const S3_ENDPOINT = process.env.S3_ENDPOINT
 const S3_REGION = process.env.S3_REGION || 'auto'
 const S3_BUCKET = process.env.S3_BUCKET
@@ -78,7 +79,7 @@ async function s3List(prefix) {
   return out
 }
 
-// Metadata
+// ==== METADATA ====
 const META_KEY = 'meta/_posts.json'
 async function readMeta() {
   const txt = await s3GetText(META_KEY)
@@ -90,6 +91,20 @@ async function writeMeta(m) {
   await s3UploadBuffer(META_KEY, buf, 'application/json')
 }
 
+// ==== JOB STORAGE (durable) ====
+function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36) }
+const VIDEO_JOBS_KEY = 'meta/_video_jobs.json'
+async function readVideoJobs(){
+  const txt = await s3GetText(VIDEO_JOBS_KEY)
+  if(!txt) return { queue: [], items: {} }
+  try { return JSON.parse(txt) } catch { return { queue: [], items: {} } }
+}
+async function writeVideoJobs(j){
+  const buf = Buffer.from(JSON.stringify(j, null, 2))
+  await s3UploadBuffer(VIDEO_JOBS_KEY, buf, 'application/json')
+}
+
+// ==== ROUTES ====
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
 // Upload
@@ -185,39 +200,99 @@ app.get('/api/posts', async (_req, res) => {
   }
 })
 
-// Generate spectral video (remove .size() to avoid -vf with -filter_complex clash)
+// ==== VIDEO GENERATION w/ RETRY QUEUE ====
+async function renderSpectralVideo(sourceKey){
+  const tmpIn = path.join(os.tmpdir(), `in-${Date.now()}.mp3`)
+  const tmpOut = path.join(os.tmpdir(), `out-${Date.now()}.mp4`)
+  await s3GetToFile(sourceKey, tmpIn)
+  ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
+  await new Promise((resolve, reject) => {
+    ffmpeg(tmpIn)
+      .outputOptions(['-y','-threads','1','-preset','veryfast','-r','24'])
+      .complexFilter([
+        'color=c=white:size=1080x1080:rate=30[bg]',
+        '[0:a]aformat=channel_layouts=stereo,showspectrum=s=1080x800:mode=combined:scale=log:color=intensity,format=yuv420p[v1]',
+        '[bg][v1]overlay=shortest=1:x=0:y=280,drawbox=x=0:y=0:w=1080:h=160:color=#052962@1:t=fill[v]'
+      ])
+      .outputOptions(['-map','[v]','-map','0:a','-shortest'])
+      .videoCodec('libx264').audioCodec('aac')
+      .on('end', resolve).on('error', reject).save(tmpOut)
+  })
+  const base = path.basename(sourceKey).replace(/\.[^/.]+$/, '')
+  const outKey = `video/${base}.mp4`
+  const outBuf = fs.readFileSync(tmpOut)
+  await s3UploadBuffer(outKey, outBuf, 'video/mp4')
+  try{ fs.unlinkSync(tmpIn) }catch{}; try{ fs.unlinkSync(tmpOut) }catch{}
+  return outKey
+}
+
+const MAX_RETRIES = 3
+function backoffMs(attempt){ return Math.min(60000, 2000 * Math.pow(2, attempt)) } // 2s, 4s, 8s, 16s, ... capped
+
+// Enqueue generate-video (durable)
 app.post('/api/generate-video', requireAdmin, async (req, res) => {
-  try {
+  try{
     const { filename } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
-    const tmpIn = path.join(os.tmpdir(), `in-${Date.now()}.mp3`)
-    const tmpOut = path.join(os.tmpdir(), `out-${Date.now()}.mp4`)
-    await s3GetToFile(filename, tmpIn)
-    ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
-    await new Promise((resolve, reject) => {
-      ffmpeg(tmpIn)
-        .outputOptions(['-y','-threads','1','-preset','veryfast','-r','24'])
-        .complexFilter([
-          'color=c=white:size=1080x1080:rate=30[bg]',
-          '[0:a]aformat=channel_layouts=stereo,showspectrum=s=1080x800:mode=combined:scale=log:color=intensity,format=yuv420p[v1]',
-          '[bg][v1]overlay=shortest=1:x=0:y=280,drawbox=x=0:y=0:w=1080:h=160:color=#052962@1:t=fill[v]'
-        ])
-        .outputOptions(['-map','[v]','-map','0:a','-shortest'])
-        .videoCodec('libx264').audioCodec('aac')
-        .on('end', resolve).on('error', reject).save(tmpOut)
-    })
-    const base = path.basename(filename).replace(/\.[^/.]+$/, '')
-    const outKey = `video/${base}.mp4`
-    const outBuf = fs.readFileSync(tmpOut)
-    await s3UploadBuffer(outKey, outBuf, 'video/mp4')
-    try{ fs.unlinkSync(tmpIn) }catch{}; try{ fs.unlinkSync(tmpOut) }catch{}
-    res.json({ key: outKey, url: publicUrlForKey(outKey) })
-  } catch (e) {
-    console.error('generate error', e); res.status(500).json({ error: 'ffmpeg failed', details: String(e) })
+    const jobs = await readVideoJobs()
+    const id = uid()
+    jobs.items[id] = { id, filename, status: 'queued', attempts: 0, nextTryAt: Date.now(), createdAt: Date.now() }
+    jobs.queue.push(id)
+    await writeVideoJobs(jobs)
+    res.json({ ok:true, id, status:'queued' })
+  }catch(e){
+    console.error('generate enqueue error', e)
+    res.status(500).json({ error: 'enqueue failed' })
   }
 })
 
-// Shorts (also remove .size() to avoid clash)
+app.get('/api/video/:id/status', async (req, res) => {
+  try{
+    const jobs = await readVideoJobs()
+    const j = jobs.items[req.params.id]
+    if(!j) return res.status(404).json({ error: 'not found' })
+    res.json(j)
+  }catch(e){
+    res.status(500).json({ error: 'status failed' })
+  }
+})
+
+// Worker
+async function processVideoOnce(){
+  const jobs = await readVideoJobs()
+  // pick first eligible job
+  const now = Date.now()
+  const idx = jobs.queue.findIndex(id => {
+    const j = jobs.items[id]; return j && (j.status==='queued' || j.status==='retry') && (j.nextTryAt||0) <= now
+  })
+  if (idx === -1) return
+  const id = jobs.queue[idx]
+  const job = jobs.items[id]
+  // mark processing
+  job.status = 'processing'; await writeVideoJobs(jobs)
+  try{
+    const outKey = await renderSpectralVideo(job.filename)
+    job.status = 'done'; job.output = outKey; await writeVideoJobs(jobs)
+  }catch(e){
+    console.error('video worker error', e)
+    job.attempts = (job.attempts||0) + 1
+    if (job.attempts >= MAX_RETRIES){
+      job.status = 'error'; job.error = String(e)
+      // remove from active queue
+      jobs.queue.splice(idx,1)
+    } else {
+      job.status = 'retry'
+      job.nextTryAt = Date.now() + backoffMs(job.attempts)
+    }
+    await writeVideoJobs(jobs)
+    return
+  }
+  // success: remove from queue
+  jobs.queue.splice(idx,1); await writeVideoJobs(jobs)
+}
+setInterval(processVideoOnce, 5000)
+
+// ==== SHORTS (unchanged from your previous package) ====
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
 const JOBS_KEY = 'meta/_shorts_jobs.json'
@@ -231,7 +306,6 @@ async function writeJobs(j) {
   const buf = Buffer.from(JSON.stringify(j, null, 2))
   await s3UploadBuffer(JOBS_KEY, buf, 'application/json')
 }
-function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36) }
 
 app.post('/api/shorts/request', requireAdmin, async (req, res) => {
   try{
@@ -329,6 +403,9 @@ async function workerOnce(){
   }
 }
 setInterval(workerOnce, 8000)
+
+// Process video queue every 5s
+setInterval(processVideoOnce, 5000)
 
 const PORT = process.env.PORT || 10000
 app.listen(PORT, () => console.log('Backend listening on', PORT))
