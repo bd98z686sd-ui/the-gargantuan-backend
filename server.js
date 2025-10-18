@@ -1,3 +1,4 @@
+
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -28,12 +29,8 @@ const S3_REGION = process.env.S3_REGION || 'auto'
 const S3_BUCKET = process.env.S3_BUCKET
 const S3_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID
 const S3_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY
-const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE // e.g. https://bucket.example.com
+const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE || ''
 const S3_FORCE_PATH_STYLE = String(process.env.S3_FORCE_PATH_STYLE).toLowerCase() === 'true'
-
-if (!S3_ENDPOINT || !S3_BUCKET || !S3_ACCESS_KEY_ID || !S3_SECRET_ACCESS_KEY) {
-  console.warn('⚠️  S3 env vars missing. Set S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY')
-}
 
 const s3 = new S3Client({
   region: S3_REGION,
@@ -43,17 +40,12 @@ const s3 = new S3Client({
 })
 
 function publicUrlForKey(key) {
-  if (S3_PUBLIC_BASE) {
-    return `${S3_PUBLIC_BASE}/${encodeURI(key)}`
-  }
-  // fallback (not always web-accessible): virtual host style may not work without DNS
+  if (S3_PUBLIC_BASE) return `${S3_PUBLIC_BASE}/${encodeURI(key)}`
   return `${S3_ENDPOINT}/${S3_BUCKET}/${encodeURI(key)}`
 }
 
 async function s3UploadBuffer(key, buffer, contentType) {
-  await s3.send(new PutObjectCommand({
-    Bucket: S3_BUCKET, Key: key, Body: buffer, ContentType: contentType
-  }))
+  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: buffer, ContentType: contentType }))
 }
 
 async function s3GetToFile(key, outPath) {
@@ -64,6 +56,17 @@ async function s3GetToFile(key, outPath) {
     Readable.from(stream).pipe(w)
     w.on('finish', resolve); w.on('error', reject)
   })
+}
+
+async function s3GetText(key) {
+  try {
+    const resp = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }))
+    const chunks = []
+    for await (const chunk of resp.Body) chunks.push(chunk)
+    return Buffer.concat(chunks).toString('utf-8')
+  } catch {
+    return null
+  }
 }
 
 async function s3List(prefix) {
@@ -78,7 +81,6 @@ async function s3List(prefix) {
 }
 
 // ---- Health ----
-app.get('/', (_req, res) => res.send('Gargantuan backend (S3 storage) live'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
 // ---- Upload (S3) ----
@@ -96,33 +98,57 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) =
   }
 })
 
-// ---- Simple posts list from S3 (videos first, then audio) ----
-app.get('/api/posts', async (req, res) => {
+// ---- METADATA store in S3 ----
+const META_KEY = 'meta/_posts.json'
+
+async function readMeta() {
+  const txt = await s3GetText(META_KEY)
+  if (!txt) return { items: {} }
+  try { return JSON.parse(txt) } catch { return { items: {} } }
+}
+async function writeMeta(m) {
+  const buf = Buffer.from(JSON.stringify(m, null, 2))
+  await s3UploadBuffer(META_KEY, buf, 'application/json')
+}
+
+// Save or update metadata (title, tagline) for a filename (S3 key)
+app.post('/api/meta', requireAdmin, async (req, res) => {
   try {
-    const vids = await s3List('video/')
-    const auds = await s3List('audio/')
+    const { filename, title, tagline } = req.body || {}
+    if (!filename) return res.status(400).json({ error: 'filename required' })
+    const meta = await readMeta()
+    meta.items[filename] = { title: title || '', tagline: tagline || '' }
+    await writeMeta(meta)
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('meta error', e)
+    res.status(500).json({ error: 'meta failed' })
+  }
+})
+
+// ---- Posts: merge S3 listings with metadata ----
+app.get('/api/posts', async (_req, res) => {
+  try {
+    const [vids, auds, meta] = await Promise.all([ s3List('video/'), s3List('audio/'), readMeta() ])
     const items = []
-    for (const v of vids) {
-      items.push({
-        filename: v.Key, // using S3 key as filename
-        title: v.Key.split('/').pop(),
-        type: 'video',
-        date: v.LastModified ? new Date(v.LastModified).toISOString() : null,
-        url: publicUrlForKey(v.Key),
-        absoluteUrl: publicUrlForKey(v.Key)
-      })
-    }
-    for (const a of auds) {
-      items.push({
-        filename: a.Key,
-        title: a.Key.split('/').pop(),
-        type: 'audio',
-        date: a.LastModified ? new Date(a.LastModified).toISOString() : null,
-        url: publicUrlForKey(a.Key),
-        absoluteUrl: publicUrlForKey(a.Key)
-      })
-    }
-    // latest first
+    for (const v of vids) items.push({
+      filename: v.Key,
+      title: (meta.items[v.Key]?.title) || v.Key.split('/').pop(),
+      tagline: meta.items[v.Key]?.tagline || '',
+      type: 'video',
+      date: v.LastModified ? new Date(v.LastModified).toISOString() : null,
+      url: publicUrlForKey(v.Key),
+      absoluteUrl: publicUrlForKey(v.Key)
+    })
+    for (const a of auds) items.push({
+      filename: a.Key,
+      title: (meta.items[a.Key]?.title) || a.Key.split('/').pop(),
+      tagline: meta.items[a.Key]?.tagline || '',
+      type: 'audio',
+      date: a.LastModified ? new Date(a.LastModified).toISOString() : null,
+      url: publicUrlForKey(a.Key),
+      absoluteUrl: publicUrlForKey(a.Key)
+    })
     items.sort((x,y) => new Date(y.date||0) - new Date(x.date||0))
     res.json(items)
   } catch (e) {
@@ -131,15 +157,14 @@ app.get('/api/posts', async (req, res) => {
   }
 })
 
-// ---- Generate video from S3 audio and upload back to S3 ----
+// ---- Generate square video from audio ----
 app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try {
-    const { filename, title = 'The Gargantuan' } = req.body || {}
+    const { filename } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
     const tmpIn = path.join(os.tmpdir(), `in-${Date.now()}.mp3`)
     const tmpOut = path.join(os.tmpdir(), `out-${Date.now()}.mp4`)
     await s3GetToFile(filename, tmpIn)
-
     ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
     await new Promise((resolve, reject) => {
       ffmpeg(tmpIn)
@@ -153,19 +178,13 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
         .videoCodec('libx264')
         .audioCodec('aac')
         .size('1080x1080')
-        .on('end', resolve)
-        .on('error', reject)
-        .save(tmpOut)
+        .on('end', resolve).on('error', reject).save(tmpOut)
     })
-
     const base = path.basename(filename).replace(/\.[^/.]+$/, '')
     const outKey = `video/${base}.mp4`
     const outBuf = fs.readFileSync(tmpOut)
     await s3UploadBuffer(outKey, outBuf, 'video/mp4')
-
-    try { fs.unlinkSync(tmpIn) } catch {}
-    try { fs.unlinkSync(tmpOut) } catch {}
-
+    try{ fs.unlinkSync(tmpIn) }catch{}; try{ fs.unlinkSync(tmpOut) }catch{}
     res.json({ key: outKey, url: publicUrlForKey(outKey) })
   } catch (e) {
     console.error('generate error', e)
@@ -173,23 +192,15 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
   }
 })
 
-// ---- Shorts (Whisper API + vertical render) ----
+// ---- Shorts (worker) ----
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
-
 const JOBS_KEY = 'meta/_shorts_jobs.json'
 
 async function readJobs() {
-  // load JSON file from S3 (or create empty)
-  try {
-    const tmp = path.join(os.tmpdir(), `jobs-${Date.now()}.json`)
-    await s3GetToFile(JOBS_KEY, tmp)
-    const txt = fs.readFileSync(tmp, 'utf-8')
-    try { fs.unlinkSync(tmp) } catch {}
-    return JSON.parse(txt)
-  } catch {
-    return { queue: [], items: {} }
-  }
+  const txt = await s3GetText(JOBS_KEY)
+  if (!txt) return { queue: [], items: {} }
+  try { return JSON.parse(txt) } catch { return { queue: [], items: {} } }
 }
 async function writeJobs(j) {
   const buf = Buffer.from(JSON.stringify(j, null, 2))
@@ -223,7 +234,7 @@ app.get('/api/shorts/:id/status', async (req, res) => {
   res.json(job)
 })
 
-app.get('/api/shorts', async (req, res) => {
+app.get('/api/shorts', async (_req, res) => {
   const jobs = await readJobs()
   const done = Object.values(jobs.items).filter(j => j.status === 'done').sort((a,b)=>b.createdAt-a.createdAt)
   res.json(done.map(j => ({ id:j.id, source:j.filename, output:j.output, url: j.output ? publicUrlForKey(j.output) : null, createdAt:j.createdAt })))
@@ -253,16 +264,11 @@ function pickSegment(tr, maxSeconds){
 }
 
 async function renderShortFromS3(sourceKey, maxSeconds){
-  // download audio to /tmp
   const tmpIn = path.join(os.tmpdir(), `short-in-${Date.now()}.mp3`)
   const tmpOut = path.join(os.tmpdir(), `short-out-${Date.now()}.mp4`)
   await s3GetToFile(sourceKey, tmpIn)
-
-  // transcribe
   const tr = await transcribeWhisper(tmpIn)
   const seg = pickSegment(tr, maxSeconds||45)
-
-  // render vertical
   await new Promise((resolve, reject) => {
     ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
     const filter = [
@@ -271,26 +277,15 @@ async function renderShortFromS3(sourceKey, maxSeconds){
       `[a1]showspectrum=s=1080x1200:mode=combined:color=intensity:scale=log,format=yuv420p[v1]`,
       `[bg][v1]overlay=shortest=1:x=0:y=360,drawbox=x=0:y=0:w=1080:h=180:color=#052962@1:t=fill[v]`
     ]
-    ffmpeg(tmpIn)
-      .outputOptions(['-y','-threads','1','-preset','veryfast','-t', String(seg.duration),'-r','30'])
-      .complexFilter(filter)
-      .outputOptions(['-map','[v]','-map','0:a','-shortest'])
-      .videoCodec('libx264')
-      .audioCodec('aac')
-      .size('1080x1920')
-      .on('end', resolve)
-      .on('error', reject)
-      .save(tmpOut)
+    ffmpeg(tmpIn).outputOptions(['-y','-threads','1','-preset','veryfast','-t', String(seg.duration),'-r','30'])
+      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest']).videoCodec('libx264').audioCodec('aac').size('1080x1920')
+      .on('end', resolve).on('error', reject).save(tmpOut)
   })
-
   const base = path.basename(sourceKey).replace(/\.[^/.]+$/, '')
   const outKey = `shorts/${base}-9x16.mp4`
   const outBuf = fs.readFileSync(tmpOut)
   await s3UploadBuffer(outKey, outBuf, 'video/mp4')
-
-  try { fs.unlinkSync(tmpIn) } catch {}
-  try { fs.unlinkSync(tmpOut) } catch {}
-
+  try{ fs.unlinkSync(tmpIn) }catch{}; try{ fs.unlinkSync(tmpOut) }catch{}
   return outKey
 }
 
@@ -298,23 +293,17 @@ async function workerOnce(){
   const jobs = await readJobs()
   const next = jobs.queue.shift()
   if (!next) return
-  await writeJobs(jobs) // persist pop
+  await writeJobs(jobs)
   try{
-    jobs.items[next].status = 'processing'
-    await writeJobs(jobs)
+    jobs.items[next].status = 'processing'; await writeJobs(jobs)
     const outKey = await renderShortFromS3(jobs.items[next].filename, jobs.items[next].maxSeconds)
-    jobs.items[next].status = 'done'
-    jobs.items[next].output = outKey
-    await writeJobs(jobs)
+    jobs.items[next].status = 'done'; jobs.items[next].output = outKey; await writeJobs(jobs)
   }catch(e){
     console.error('worker error', e)
-    jobs.items[next].status = 'error'
-    jobs.items[next].error = String(e)
-    await writeJobs(jobs)
+    jobs.items[next].status = 'error'; jobs.items[next].error = String(e); await writeJobs(jobs)
   }
 }
 setInterval(workerOnce, 8000)
 
-// ---- Start ----
 const PORT = process.env.PORT || 10000
 app.listen(PORT, () => console.log('Backend listening on', PORT))
