@@ -1,6 +1,6 @@
 {
-  "name": "the-gargantuan-backend-s3",
-  "version": "3.1.0",
+  "name": "the-gargantuan-backend-spectral-r2",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "main": "server.js",
@@ -8,12 +8,12 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.670.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1",
     "fluent-ffmpeg": "^2.1.2",
     "ffmpeg-static": "^5.2.0",
-    "@aws-sdk/client-s3": "^3.670.0",
+    "multer": "^1.4.5-lts.1",
     "openai": "^4.56.0"
   }
 }

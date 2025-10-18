@@ -1,4 +1,5 @@
 FROM node:20-slim
+# ffmpeg-static is used by fluent-ffmpeg, but keep system ffmpeg too for fallback
 RUN apt-get update && apt-get install -y ffmpeg fontconfig && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package*.json ./

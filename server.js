@@ -23,7 +23,6 @@ function requireAdmin(req, res, next) {
   next()
 }
 
-// ---- S3 client ----
 const S3_ENDPOINT = process.env.S3_ENDPOINT
 const S3_REGION = process.env.S3_REGION || 'auto'
 const S3_BUCKET = process.env.S3_BUCKET
@@ -31,6 +30,10 @@ const S3_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID
 const S3_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY
 const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE || ''
 const S3_FORCE_PATH_STYLE = String(process.env.S3_FORCE_PATH_STYLE).toLowerCase() === 'true'
+
+if (!S3_ENDPOINT || !S3_BUCKET) {
+  console.warn('WARN: S3/R2 env not fully set. Set S3_ENDPOINT and S3_BUCKET at minimum.')
+}
 
 const s3 = new S3Client({
   region: S3_REGION,
@@ -80,38 +83,36 @@ async function s3List(prefix) {
   return out
 }
 
-// ---- Health ----
-app.get('/api/health', (_req, res) => res.json({ ok: true }))
-
-// ---- Upload (S3) ----
-const upload = multer({ storage: multer.memoryStorage() })
-app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
-    const safeName = (req.file.originalname || 'audio.mp3').replace(/\s+/g, '-')
-    const key = `audio/${Date.now()}-${safeName}`
-    await s3UploadBuffer(key, req.file.buffer, req.file.mimetype || 'audio/mpeg')
-    return res.json({ key, url: publicUrlForKey(key) })
-  } catch (e) {
-    console.error('upload error', e)
-    res.status(500).json({ error: 'upload failed' })
-  }
-})
-
-// ---- METADATA store in S3 ----
+// Metadata
 const META_KEY = 'meta/_posts.json'
-
 async function readMeta() {
   const txt = await s3GetText(META_KEY)
-  if (!txt) return { items: {} }
-  try { return JSON.parse(txt) } catch { return { items: {} } }
+  if (!txt) return { items: {}, deleted: {} }
+  try { const m = JSON.parse(txt); return { items: m.items||{}, deleted: m.deleted||{} } } catch { return { items: {}, deleted: {} } }
 }
 async function writeMeta(m) {
   const buf = Buffer.from(JSON.stringify(m, null, 2))
   await s3UploadBuffer(META_KEY, buf, 'application/json')
 }
 
-// Save or update metadata (title, tagline) for a filename (S3 key)
+app.get('/api/health', (_req, res) => res.json({ ok: true }))
+
+// Upload
+const upload = multer({ storage: multer.memoryStorage() })
+app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
+    const safe = (req.file.originalname || 'audio.mp3').replace(/\s+/g, '-')
+    const key = `audio/${Date.now()}-${safe}`
+    await s3UploadBuffer(key, req.file.buffer, req.file.mimetype || 'audio/mpeg')
+    res.json({ key, url: publicUrlForKey(key) })
+  } catch (e) {
+    console.error('upload error', e)
+    res.status(500).json({ error: 'upload failed' })
+  }
+})
+
+// Meta
 app.post('/api/meta', requireAdmin, async (req, res) => {
   try {
     const { filename, title, tagline } = req.body || {}
@@ -121,43 +122,75 @@ app.post('/api/meta', requireAdmin, async (req, res) => {
     await writeMeta(meta)
     res.json({ ok: true })
   } catch (e) {
-    console.error('meta error', e)
-    res.status(500).json({ error: 'meta failed' })
+    console.error('meta error', e); res.status(500).json({ error: 'meta failed' })
   }
 })
 
-// ---- Posts: merge S3 listings with metadata ----
+// Soft delete / restore
+app.post('/api/soft-delete', requireAdmin, async (req, res) => {
+  try {
+    const { filenames } = req.body || {}
+    if (!Array.isArray(filenames)) return res.status(400).json({ error: 'filenames[] required' })
+    const meta = await readMeta()
+    filenames.forEach(fn => { meta.deleted[fn] = true })
+    await writeMeta(meta)
+    res.json({ ok: true, count: filenames.length })
+  } catch (e) {
+    console.error('soft-delete error', e); res.status(500).json({ error: 'soft-delete failed' })
+  }
+})
+
+app.post('/api/restore', requireAdmin, async (req, res) => {
+  try {
+    const { filenames } = req.body || {}
+    if (!Array.isArray(filenames)) return res.status(400).json({ error: 'filenames[] required' })
+    const meta = await readMeta()
+    filenames.forEach(fn => { delete meta.deleted[fn] })
+    await writeMeta(meta)
+    res.json({ ok: true, count: filenames.length })
+  } catch (e) {
+    console.error('restore error', e); res.status(500).json({ error: 'restore failed' })
+  }
+})
+
+// Posts (merge R2 listings with metadata, hide soft-deleted)
 app.get('/api/posts', async (_req, res) => {
   try {
     const [vids, auds, meta] = await Promise.all([ s3List('video/'), s3List('audio/'), readMeta() ])
+    const hidden = meta.deleted || {}
     const items = []
-    for (const v of vids) items.push({
-      filename: v.Key,
-      title: (meta.items[v.Key]?.title) || v.Key.split('/').pop(),
-      tagline: meta.items[v.Key]?.tagline || '',
-      type: 'video',
-      date: v.LastModified ? new Date(v.LastModified).toISOString() : null,
-      url: publicUrlForKey(v.Key),
-      absoluteUrl: publicUrlForKey(v.Key)
-    })
-    for (const a of auds) items.push({
-      filename: a.Key,
-      title: (meta.items[a.Key]?.title) || a.Key.split('/').pop(),
-      tagline: meta.items[a.Key]?.tagline || '',
-      type: 'audio',
-      date: a.LastModified ? new Date(a.LastModified).toISOString() : null,
-      url: publicUrlForKey(a.Key),
-      absoluteUrl: publicUrlForKey(a.Key)
-    })
+    for (const v of vids) {
+      if (hidden[v.Key]) continue
+      items.push({
+        filename: v.Key,
+        title: (meta.items[v.Key]?.title) || v.Key.split('/').pop(),
+        tagline: meta.items[v.Key]?.tagline || '',
+        type: 'video',
+        date: v.LastModified ? new Date(v.LastModified).toISOString() : null,
+        url: publicUrlForKey(v.Key),
+        absoluteUrl: publicUrlForKey(v.Key)
+      })
+    }
+    for (const a of auds) {
+      if (hidden[a.Key]) continue
+      items.push({
+        filename: a.Key,
+        title: (meta.items[a.Key]?.title) || a.Key.split('/').pop(),
+        tagline: meta.items[a.Key]?.tagline || '',
+        type: 'audio',
+        date: a.LastModified ? new Date(a.LastModified).toISOString() : null,
+        url: publicUrlForKey(a.Key),
+        absoluteUrl: publicUrlForKey(a.Key)
+      })
+    }
     items.sort((x,y) => new Date(y.date||0) - new Date(x.date||0))
     res.json(items)
   } catch (e) {
-    console.error('list error', e)
-    res.status(500).json({ error: 'list failed' })
+    console.error('list error', e); res.status(500).json({ error: 'list failed' })
   }
 })
 
-// ---- Generate square video from audio ----
+// Generate spectral video
 app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try {
     const { filename } = req.body || {}
@@ -167,17 +200,16 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     await s3GetToFile(filename, tmpIn)
     ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
     await new Promise((resolve, reject) => {
+      // Guardian-style banner + showspectrum in square
       ffmpeg(tmpIn)
         .outputOptions(['-y','-threads','1','-preset','veryfast','-r','24'])
         .complexFilter([
-          `color=c=white:size=1080x1080:rate=30[bg]`,
-          `[0:a]aformat=channel_layouts=stereo,showspectrum=s=1080x800:mode=combined:scale=log:color=intensity,format=yuv420p[v1]`,
-          `[bg][v1]overlay=shortest=1:x=0:y=280,drawbox=x=0:y=0:w=1080:h=160:color=#052962@1:t=fill[v]`
+          'color=c=white:size=1080x1080:rate=30[bg]',
+          '[0:a]aformat=channel_layouts=stereo,showspectrum=s=1080x800:mode=combined:scale=log:color=intensity,format=yuv420p[v1]',
+          '[bg][v1]overlay=shortest=1:x=0:y=280,drawbox=x=0:y=0:w=1080:h=160:color=#052962@1:t=fill[v]'
         ])
         .outputOptions(['-map','[v]','-map','0:a','-shortest'])
-        .videoCodec('libx264')
-        .audioCodec('aac')
-        .size('1080x1080')
+        .videoCodec('libx264').audioCodec('aac').size('1080x1080')
         .on('end', resolve).on('error', reject).save(tmpOut)
     })
     const base = path.basename(filename).replace(/\.[^/.]+$/, '')
@@ -187,12 +219,11 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     try{ fs.unlinkSync(tmpIn) }catch{}; try{ fs.unlinkSync(tmpOut) }catch{}
     res.json({ key: outKey, url: publicUrlForKey(outKey) })
   } catch (e) {
-    console.error('generate error', e)
-    res.status(500).json({ error: 'ffmpeg failed', details: String(e) })
+    console.error('generate error', e); res.status(500).json({ error: 'ffmpeg failed', details: String(e) })
   }
 })
 
-// ---- Shorts (worker) ----
+// Shorts (optional worker)
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
 const JOBS_KEY = 'meta/_shorts_jobs.json'
