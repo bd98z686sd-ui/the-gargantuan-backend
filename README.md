@@ -1,32 +1,39 @@
-# The Gargantuan — Backend (Final)
+# The Gargantuan — Backend (Auth Enabled)
 
-Express backend for audio uploads, simple spectrum video generation, and a posts feed for the frontend.
+Express backend for audio uploads, spectrum video generation, and a posts feed.
+Includes optional admin auth via `x-admin-token` header controlled by `ADMIN_TOKEN` env var.
 
 ## Endpoints
 - `GET /` — health
-- `POST /api/upload` — multipart upload (`audio` field). Returns `{ filename, url, absoluteUrl }`.
-- `POST /api/generate-video` — `{"filename":"<uploaded.mp3>", "title":"The Gargantuan"}` → creates MP4 spectrum.
-- `GET /api/posts` — lists `.mp3` and `.mp4`, newest first.
-- `GET /api/list` — raw file list (debug).
+- `GET /api/health` — json health
+- `GET /api/posts` — lists `.mp3` and `.mp4`, newest first
+- `POST /api/upload` — multipart (`audio` field) — **requires token if `ADMIN_TOKEN` is set**
+- `POST /api/generate-video` — `{"filename":"<uploaded.mp3>","title":"..."}` — **requires token if `ADMIN_TOKEN` is set**
+- `GET /api/list` — raw files list (debug)
+
+## Environment
+- `PORT` (default `10000`)
+- `UPLOAD_DIR` (default `./uploads`)
+- `PUBLIC_BASE_URL` (optional absolute URL used in responses)
+- `ADMIN_TOKEN` (optional; if set, protects publish endpoints)
 
 ## Deploy on Render
-1. Create a new **Web Service** from this folder (Dockerfile is included).
-2. It will build with Node 20 and install ffmpeg.
-3. Add a **Disk** at `/app/uploads` if you want files to persist between deploys.
-4. After deploy: `https://YOUR-RENDER-URL/api/posts` should return JSON.
+1. Create a new **Web Service** from this folder (Dockerfile included).
+2. Add **Environment Variables** you want, e.g.:
+   - `ADMIN_TOKEN=supersecret`
+   - `PUBLIC_BASE_URL=https://the-gargantuan-backend.onrender.com`
+3. Add a **Disk** mounted at `/app/uploads` to persist files.
+4. After deploy, test:
+   ```bash
+   curl https://YOUR-RENDER-URL/api/health
+   curl https://YOUR-RENDER-URL/api/posts
+   ```
 
-## Example usage
-Upload:
+## Publish from CLI
 ```bash
-curl -X POST -F "audio=@/path/to/audio.mp3" https://YOUR-RENDER-URL/api/upload
-```
+# Upload (with admin token)
+curl -X POST -H "x-admin-token: supersecret"   -F "audio=@/path/to/audio.mp3" https://YOUR-RENDER-URL/api/upload
 
-Generate video:
-```bash
-curl -X POST -H "Content-Type: application/json"   -d '{"filename":"PASTE_FILENAME_FROM_UPLOAD","title":"The Gargantuan"}'   https://YOUR-RENDER-URL/api/generate-video
-```
-
-List posts:
-```bash
-curl https://YOUR-RENDER-URL/api/posts
+# Generate video (with admin token)
+curl -X POST -H "Content-Type: application/json" -H "x-admin-token: supersecret"   -d '{"filename":"PASTE_FILENAME","title":"The Gargantuan"}'   https://YOUR-RENDER-URL/api/generate-video
 ```

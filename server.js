@@ -25,8 +25,20 @@ const storage = multer.diskStorage({
 })
 const upload = multer({ storage })
 
+// --- Admin token middleware ---
+function requireAdmin(req, res, next) {
+  const expected = process.env.ADMIN_TOKEN
+  if (!expected) return next() // if no token set, allow
+  const provided = req.get('x-admin-token')
+  if (provided !== expected) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+  next()
+}
+
 // --- Health ---
 app.get('/', (_req, res) => res.send('The Gargantuan backend is live.'))
+app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
 // --- List posts (mp3 + mp4), newest first ---
 app.get('/api/posts', (req, res) => {
@@ -55,8 +67,8 @@ app.get('/api/posts', (req, res) => {
   }
 })
 
-// --- Upload audio ---
-app.post('/api/upload', upload.single('audio'), (req, res) => {
+// --- Upload audio (protected if ADMIN_TOKEN is set) ---
+app.post('/api/upload', requireAdmin, upload.single('audio'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded (field name must be audio)' })
   const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
   res.json({
@@ -67,8 +79,8 @@ app.post('/api/upload', upload.single('audio'), (req, res) => {
   })
 })
 
-// --- Generate spectrum video from audio ---
-app.post('/api/generate-video', async (req, res) => {
+// --- Generate spectrum video from audio (protected if ADMIN_TOKEN is set) ---
+app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try {
     const { filename, title = 'The Gargantuan' } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename required' })
