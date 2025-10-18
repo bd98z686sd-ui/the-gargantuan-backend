@@ -33,21 +33,30 @@ app.post('/api/generate-video', async (req, res) => {
     const outName = filename.replace(/\.[^.]+$/, '') + '.mp4'
     const outPath = path.join(uploadDir, outName)
 
-    ffmpeg.setFfmpegPath(ffmpegStatic)
-    ffmpeg(inPath)
-      .outputOptions(['-y'])
-     .complexFilter([
-  "[0:a]aformat=channel_layouts=stereo," +
-  "showspectrum=s=640x360:mode=combined:scale=log:color=intensity," +
-  "format=yuv420p[v]"
-])
-.outputOptions(['-map', '[v]', '-map', '0:a', '-shortest'])
+    ffmpeg.setFfmpegPath(ffmpegStatic);
+
+ffmpeg(inPath)
+  // Limit FFmpeg resource use
+  .outputOptions([
+    '-y',
+    '-threads 1',
+    '-preset ultrafast',
+    '-r 24',          // 24 fps
+    '-t 60',          // cap video length for test (60s)
+  ])
+  .complexFilter([
+    "[0:a]aformat=channel_layouts=stereo," +
+    "showspectrum=s=480x270:mode=combined:scale=log:color=intensity,format=yuv420p[v]"
+  ])
+  .outputOptions(['-map', '[v]', '-map', '0:a', '-shortest'])
   .videoCodec('libx264')
   .audioCodec('aac')
   .output(outPath)
   .on('end', () => res.json({ output: '/uploads/' + outName }))
-  .on('error', (err) => res.status(500).json({ error: 'ffmpeg failed', details: String(err) }))
-  .run()
+  .on('error', err =>
+    res.status(500).json({ error: 'ffmpeg failed', details: String(err) })
+  )
+  .run();
   } catch (err) {
     res.status(500).json({ error: 'server error', details: String(err) })
   }
