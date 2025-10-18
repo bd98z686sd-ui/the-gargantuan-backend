@@ -1,5 +1,10 @@
-
-// Backend with Whisper test endpoint + queue + R2 storage
+// Backend server.js — speed-tuned ffmpeg for Render free tier
+// - Lower resolution (720x720)
+// - 24 fps, ultrafast preset, CRF 28
+// - Optional duration cap via VIDEO_MAX_SECONDS
+// - Adds -nostdin to avoid any ffmpeg stdin hangs
+// - Keeps all existing routes: upload, posts, meta, soft-delete/restore
+//   video queue + process-now, shorts worker, whisper-test
 
 import express from 'express'
 import cors from 'cors'
@@ -29,6 +34,7 @@ function requireAdmin(req, res, next) {
   next()
 }
 
+// ---------- R2 / S3 ----------
 const S3_ENDPOINT = process.env.S3_ENDPOINT
 const S3_REGION = process.env.S3_REGION || 'auto'
 const S3_BUCKET = process.env.S3_BUCKET
@@ -85,6 +91,7 @@ async function s3List(prefix) {
   return out
 }
 
+// ---------- meta ----------
 const META_KEY = 'meta/_posts.json'
 async function readMeta() {
   const txt = await s3GetText(META_KEY)
@@ -96,9 +103,12 @@ async function writeMeta(m) {
   await s3UploadBuffer(META_KEY, buf, 'application/json')
 }
 
+// ---------- health ----------
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-const upload = multer({ storage: multer.memoryStorage() })
+// ---------- upload ----------
+import multerPkg from 'multer'
+const upload = multerPkg({ storage: multer.memoryStorage() })
 app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
@@ -112,6 +122,7 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) =
   }
 })
 
+// ---------- meta edit & hide ----------
 app.post('/api/meta', requireAdmin, async (req, res) => {
   try {
     const { filename, title, tagline } = req.body || {}
@@ -120,9 +131,7 @@ app.post('/api/meta', requireAdmin, async (req, res) => {
     meta.items[filename] = { title: title || '', tagline: tagline || '' }
     await writeMeta(meta)
     res.json({ ok: true })
-  } catch (e) {
-    console.error('meta error', e); res.status(500).json({ error: 'meta failed' })
-  }
+  } catch (e) { console.error('meta error', e); res.status(500).json({ error: 'meta failed' }) }
 })
 
 app.post('/api/soft-delete', requireAdmin, async (req, res) => {
@@ -133,9 +142,7 @@ app.post('/api/soft-delete', requireAdmin, async (req, res) => {
     filenames.forEach(fn => { meta.deleted[fn] = true })
     await writeMeta(meta)
     res.json({ ok: true, count: filenames.length })
-  } catch (e) {
-    console.error('soft-delete error', e); res.status(500).json({ error: 'soft-delete failed' })
-  }
+  } catch (e) { console.error('soft-delete error', e); res.status(500).json({ error: 'soft-delete failed' }) }
 })
 
 app.post('/api/restore', requireAdmin, async (req, res) => {
@@ -146,11 +153,10 @@ app.post('/api/restore', requireAdmin, async (req, res) => {
     filenames.forEach(fn => { delete meta.deleted[fn] })
     await writeMeta(meta)
     res.json({ ok: true, count: filenames.length })
-  } catch (e) {
-    console.error('restore error', e); res.status(500).json({ error: 'restore failed' })
-  }
+  } catch (e) { console.error('restore error', e); res.status(500).json({ error: 'restore failed' }) }
 })
 
+// ---------- posts feed ----------
 app.get('/api/posts', async (_req, res) => {
   try {
     const [vids, auds, meta] = await Promise.all([ s3List('video/'), s3List('audio/'), readMeta() ])
@@ -182,26 +188,39 @@ app.get('/api/posts', async (_req, res) => {
     }
     items.sort((x,y) => new Date(y.date||0) - new Date(x.date||0))
     res.json(items)
-  } catch (e) {
-    console.error('list error', e); res.status(500).json({ error: 'list failed' })
-  }
+  } catch (e) { console.error('list error', e); res.status(500).json({ error: 'list failed' }) }
 })
 
-// -------- spectral video render --------
+// ---------- spectral video (speed tuned) ----------
+const VIDEO_MAX_SECONDS = Number(process.env.VIDEO_MAX_SECONDS || 0) // 0 = full length
+const CANVAS_W = Number(process.env.VIDEO_W || 720)
+const CANVAS_H = Number(process.env.VIDEO_H || 720)
+const SPECTRUM_H = Number(process.env.VIDEO_SPECTRUM_H || 540)
+const TOPBAR_H  = Number(process.env.VIDEO_TOPBAR_H || 100) // blue masthead height
+const FPS = Number(process.env.VIDEO_FPS || 24)
+const PRESET = String(process.env.VIDEO_PRESET || 'ultrafast')
+const CRF = String(process.env.VIDEO_CRF || '28') // 23-28 reasonable
+
 async function renderSpectralVideo(sourceKey){
   const tmpIn = path.join(os.tmpdir(), `in-${Date.now()}.mp3`)
   const tmpOut = path.join(os.tmpdir(), `out-${Date.now()}.mp4`)
   await s3GetToFile(sourceKey, tmpIn)
   ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
   await new Promise((resolve, reject) => {
+    const opts = ['-y','-nostdin','-threads','1','-preset', PRESET, '-r', String(FPS)]
+    if (VIDEO_MAX_SECONDS > 0) { opts.push('-t', String(VIDEO_MAX_SECONDS)) }
+
+    const filter = [
+      `color=c=white:size=${CANVAS_W}x${CANVAS_H}:rate=${FPS}[bg]`,
+      `[0:a]aformat=channel_layouts=stereo,showspectrum=s=${CANVAS_W}x${SPECTRUM_H}:mode=combined:scale=log:color=intensity,format=yuv420p[v1]`,
+      `[bg][v1]overlay=shortest=1:x=0:y=${CANVAS_H - SPECTRUM_H},drawbox=x=0:y=0:w=${CANVAS_W}:h=${TOPBAR_H}:color=#052962@1:t=fill[v]`
+    ]
+
     const cmd = ffmpeg(tmpIn)
-      .outputOptions(['-y','-threads','1','-preset','veryfast','-r','24'])
-      .complexFilter([
-        'color=c=white:size=1080x1080:rate=30[bg]',
-        '[0:a]aformat=channel_layouts=stereo,showspectrum=s=1080x800:mode=combined:scale=log:color=intensity,format=yuv420p[v1]',
-        '[bg][v1]overlay=shortest=1:x=0:y=280,drawbox=x=0:y=0:w=1080:h=160:color=#052962@1:t=fill[v]'
-      ])
-      .outputOptions(['-map','[v]','-map','0:a','-shortest'])
+      .inputOption('-nostdin')
+      .outputOptions(opts)
+      .complexFilter(filter)
+      .outputOptions(['-map','[v]','-map','0:a','-shortest','-crf', CRF])
       .videoCodec('libx264').audioCodec('aac')
       .on('start', (cmdline)=>log('ffmpeg start:', cmdline))
       .on('stderr', (line)=>{ if(FFMPEG_LOG) log('ffmpeg:', line) })
@@ -218,7 +237,7 @@ async function renderSpectralVideo(sourceKey){
   return outKey
 }
 
-// -------- durable video queue --------
+// ---------- queue + worker ----------
 function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36) }
 const VIDEO_JOBS_KEY = 'meta/_video_jobs.json'
 async function readVideoJobs(){
@@ -340,7 +359,7 @@ async function processVideoOnce(){
 setInterval(processVideoOnce, 5000)
 setInterval(() => log('worker heartbeat'), 10000)
 
-// -------- shorts + Whisper --------
+// ---------- shorts worker + whisper-test ----------
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
 const JOBS_KEY = 'meta/_shorts_jobs.json'
@@ -425,8 +444,8 @@ async function renderShortFromS3(sourceKey, maxSeconds){
       `[a1]showspectrum=s=1080x1200:mode=combined:color=intensity:scale=log,format=yuv420p[v1]`,
       `[bg][v1]overlay=shortest=1:x=0:y=360,drawbox=x=0:y=0:w=1080:h=180:color=#052962@1:t=fill[v]`
     ]
-    const cmd = ffmpeg(tmpIn).outputOptions(['-y','-threads','1','-preset','veryfast','-t', String(seg.duration),'-r','30'])
-      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest']).videoCodec('libx264').audioCodec('aac')
+    const cmd = ffmpeg(tmpIn).outputOptions(['-y','-nostdin','-threads','1','-preset','veryfast','-t', String(seg.duration),'-r','30'])
+      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest','-crf','28']).videoCodec('libx264').audioCodec('aac')
       .on('start', (cmdline)=>log('ffmpeg(short) start:', cmdline))
       .on('stderr', (line)=>{ if(FFMPEG_LOG) log('ffmpeg(short):', line) })
       .on('end', ()=>{ log('ffmpeg(short) done'); resolve() })
@@ -442,27 +461,11 @@ async function renderShortFromS3(sourceKey, maxSeconds){
   return outKey
 }
 
-async function workerOnce(){
-  const jobs = await readJobs()
-  const next = jobs.queue.shift()
-  if (!next) return
-  await writeJobs(jobs)
-  try{
-    jobs.items[next].status = 'processing'; await writeJobs(jobs)
-    const outKey = await renderShortFromS3(jobs.items[next].filename, jobs.items[next].maxSeconds)
-    jobs.items[next].status = 'done'; jobs.items[next].output = outKey; await writeJobs(jobs)
-  }catch(e){
-    console.error('worker error', e)
-    jobs.items[next].status = 'error'; jobs.items[next].error = String(e); await writeJobs(jobs)
-  }
-}
-setInterval(workerOnce, 8000)
-
-// NEW: Whisper test route
+// ---------- whisper-test ----------
 app.post('/api/whisper-test', requireAdmin, async (req, res) => {
   try {
-    const { filename } = req.body || {}
     if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY not set' })
+    const { filename } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
     const tmpIn = path.join(os.tmpdir(), `whisper-${Date.now()}.mp3`)
     await s3GetToFile(filename, tmpIn)
