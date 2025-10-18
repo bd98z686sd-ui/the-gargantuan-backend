@@ -36,15 +36,12 @@ app.post('/api/generate-video', async (req, res) => {
     ffmpeg.setFfmpegPath(ffmpegStatic)
     ffmpeg(inPath)
       .outputOptions(['-y'])
-      .complexFilter([
-        // Build the video from audio, tint with mustard, and NAME it [v]
-    "[0:a]aformat=channel_layouts=stereo," +
-    "showspectrum=s=1280x720:mode=separate:color=intensity:scale=log," +
-    "format=yuv420p," +
-    "drawbox=x=0:y=0:w=iw:h=ih:color=#d2a106@0.25:t=fill[v]"
-  ])
-  // ⬇️ Explicitly map the labeled video and the original audio
-  .outputOptions(['-map', '[v]', '-map', '0:a', '-shortest'])
+     .complexFilter([
+  "[0:a]aformat=channel_layouts=stereo," +
+  "showspectrum=s=640x360:mode=combined:scale=log:color=intensity," +
+  "format=yuv420p[v]"
+])
+.outputOptions(['-map', '[v]', '-map', '0:a', '-shortest'])
   .videoCodec('libx264')
   .audioCodec('aac')
   .output(outPath)
