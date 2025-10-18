@@ -37,16 +37,20 @@ app.post('/api/generate-video', async (req, res) => {
     ffmpeg(inPath)
       .outputOptions(['-y'])
       .complexFilter([
-        "[0:a]aformat=channel_layouts=stereo,showspectrum=s=1280x720:mode=separate:color=intensity:scale=log,format=rgba[s]",
-        "[s]drawbox=x=0:y=0:w=iw:h=ih:color=#d2a106@0.25:t=fill[v]"
-      ])
-      .videoCodec('libx264')
-      .audioCodec('aac')
-      .outputOptions(['-shortest'])
-      .output(outPath)
-      .on('end', () => res.json({ output: '/uploads/' + outName }))
-      .on('error', (err) => res.status(500).json({ error: 'ffmpeg failed', details: String(err) }))
-      .run()
+        // Build the video from audio, tint with mustard, and NAME it [v]
+    "[0:a]aformat=channel_layouts=stereo," +
+    "showspectrum=s=1280x720:mode=separate:color=intensity:scale=log," +
+    "format=yuv420p," +
+    "drawbox=x=0:y=0:w=iw:h=ih:color=#d2a106@0.25:t=fill[v]"
+  ])
+  // ⬇️ Explicitly map the labeled video and the original audio
+  .outputOptions(['-map', '[v]', '-map', '0:a', '-shortest'])
+  .videoCodec('libx264')
+  .audioCodec('aac')
+  .output(outPath)
+  .on('end', () => res.json({ output: '/uploads/' + outName }))
+  .on('error', (err) => res.status(500).json({ error: 'ffmpeg failed', details: String(err) }))
+  .run()
   } catch (err) {
     res.status(500).json({ error: 'server error', details: String(err) })
   }
