@@ -1,3 +1,6 @@
+
+// Backend with Whisper test endpoint + queue + R2 storage
+
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -10,7 +13,6 @@ import OpenAI from 'openai'
 import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3'
 import { Readable } from 'node:stream'
 
-// ------------ util logging -------------
 const FFMPEG_LOG = String(process.env.FFMPEG_LOG || '').trim() === '1';
 function log(...args){ console.log('[video]', ...args) }
 function logErr(...args){ console.error('[video]', ...args) }
@@ -19,7 +21,6 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// ------------- auth --------------
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return next()
@@ -28,7 +29,6 @@ function requireAdmin(req, res, next) {
   next()
 }
 
-// ------------- R2 (S3) --------------
 const S3_ENDPOINT = process.env.S3_ENDPOINT
 const S3_REGION = process.env.S3_REGION || 'auto'
 const S3_BUCKET = process.env.S3_BUCKET
@@ -85,7 +85,6 @@ async function s3List(prefix) {
   return out
 }
 
-// ------------- metadata --------------
 const META_KEY = 'meta/_posts.json'
 async function readMeta() {
   const txt = await s3GetText(META_KEY)
@@ -97,10 +96,8 @@ async function writeMeta(m) {
   await s3UploadBuffer(META_KEY, buf, 'application/json')
 }
 
-// ------------- health --------------
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// ------------- upload --------------
 const upload = multer({ storage: multer.memoryStorage() })
 app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) => {
   try {
@@ -115,7 +112,6 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) =
   }
 })
 
-// ------------- meta edit --------------
 app.post('/api/meta', requireAdmin, async (req, res) => {
   try {
     const { filename, title, tagline } = req.body || {}
@@ -129,7 +125,6 @@ app.post('/api/meta', requireAdmin, async (req, res) => {
   }
 })
 
-// ------------- soft delete / restore --------------
 app.post('/api/soft-delete', requireAdmin, async (req, res) => {
   try {
     const { filenames } = req.body || {}
@@ -156,7 +151,6 @@ app.post('/api/restore', requireAdmin, async (req, res) => {
   }
 })
 
-// ------------- posts --------------
 app.get('/api/posts', async (_req, res) => {
   try {
     const [vids, auds, meta] = await Promise.all([ s3List('video/'), s3List('audio/'), readMeta() ])
@@ -193,7 +187,7 @@ app.get('/api/posts', async (_req, res) => {
   }
 })
 
-// ------------- video rendering (spectral) --------------
+// -------- spectral video render --------
 async function renderSpectralVideo(sourceKey){
   const tmpIn = path.join(os.tmpdir(), `in-${Date.now()}.mp3`)
   const tmpOut = path.join(os.tmpdir(), `out-${Date.now()}.mp4`)
@@ -224,7 +218,7 @@ async function renderSpectralVideo(sourceKey){
   return outKey
 }
 
-// ------------- durable queue for video jobs --------------
+// -------- durable video queue --------
 function uid(){ return Math.random().toString(36).slice(2) + Date.now().toString(36) }
 const VIDEO_JOBS_KEY = 'meta/_video_jobs.json'
 async function readVideoJobs(){
@@ -238,7 +232,7 @@ async function writeVideoJobs(j){
 }
 
 const MAX_RETRIES = 3
-function backoffMs(attempt){ return Math.min(60000, 2000 * Math.pow(2, attempt)) } // 2s,4s,8s,...
+function backoffMs(attempt){ return Math.min(60000, 2000 * Math.pow(2, attempt)) }
 
 app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try{
@@ -267,18 +261,11 @@ app.get('/api/video/:id/status', async (req, res) => {
   }
 })
 
-// Inspect all video jobs (debug)
 app.get('/api/video/jobs', async (_req, res) => {
-  try {
-    const jobs = await readVideoJobs();
-    res.json(jobs);
-  } catch (e) {
-    logErr('jobs debug error', e);
-    res.status(500).json({ error: 'debug failed' });
-  }
+  try { const jobs = await readVideoJobs(); res.json(jobs) }
+  catch(e){ logErr('jobs debug error', e); res.status(500).json({ error: 'debug failed' }) }
 })
 
-// Manually process a job now (debug)
 app.post('/api/video/process-now', requireAdmin, async (req, res) => {
   try {
     const { id } = req.query;
@@ -303,7 +290,6 @@ app.post('/api/video/process-now', requireAdmin, async (req, res) => {
       job.attempts = (job.attempts || 0) + 1;
       if (job.attempts >= MAX_RETRIES) {
         job.status = 'error'; job.error = String(e);
-        // remove from queue
         const idx = (jobs.queue || []).indexOf(id);
         if (idx >= 0) jobs.queue.splice(idx, 1);
       } else {
@@ -321,10 +307,8 @@ app.post('/api/video/process-now', requireAdmin, async (req, res) => {
   }
 })
 
-// Worker
 async function processVideoOnce(){
   const jobs = await readVideoJobs()
-  // pick first eligible job
   const now = Date.now()
   const idx = jobs.queue.findIndex(id => {
     const j = jobs.items[id]; return j && (j.status==='queued' || j.status==='retry') && (j.nextTryAt||0) <= now
@@ -333,12 +317,10 @@ async function processVideoOnce(){
   const id = jobs.queue[idx]
   const job = jobs.items[id]
   log('worker picked', id, job.filename)
-  // mark processing
   job.status = 'processing'; await writeVideoJobs(jobs)
   try{
     const outKey = await renderSpectralVideo(job.filename)
     job.status = 'done'; job.output = outKey; await writeVideoJobs(jobs)
-    // success: remove from queue
     jobs.queue.splice(idx,1); await writeVideoJobs(jobs)
     log('worker done', id, outKey)
   }catch(e){
@@ -356,11 +338,9 @@ async function processVideoOnce(){
   }
 }
 setInterval(processVideoOnce, 5000)
-
-// heartbeat so we know the worker isn't frozen
 setInterval(() => log('worker heartbeat'), 10000)
 
-// ------------- shorts (unchanged) --------------
+// -------- shorts + Whisper --------
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
 const JOBS_KEY = 'meta/_shorts_jobs.json'
@@ -380,6 +360,7 @@ app.post('/api/shorts/request', requireAdmin, async (req, res) => {
     if (String(process.env.SHORTS_ENABLED).toLowerCase() !== 'true') {
       return res.status(400).json({ error: 'Shorts disabled (set SHORTS_ENABLED=true)' })
     }
+    if (!openai) return res.status(400).json({ error: 'OPENAI_API_KEY not set' })
     const { filename, maxSeconds } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
     const id = uid()
@@ -477,6 +458,28 @@ async function workerOnce(){
 }
 setInterval(workerOnce, 8000)
 
-// ------------- server --------------
+// NEW: Whisper test route
+app.post('/api/whisper-test', requireAdmin, async (req, res) => {
+  try {
+    const { filename } = req.body || {}
+    if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY not set' })
+    if (!filename) return res.status(400).json({ error: 'filename (S3 key) required' })
+    const tmpIn = path.join(os.tmpdir(), `whisper-${Date.now()}.mp3`)
+    await s3GetToFile(filename, tmpIn)
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    const resp = await client.audio.transcriptions.create({
+      file: fs.createReadStream(tmpIn),
+      model: 'whisper-1',
+      response_format: 'verbose_json',
+      temperature: 0
+    })
+    try { fs.unlinkSync(tmpIn) } catch {}
+    return res.json({ ok: true, text: resp.text, language: resp.language || 'unknown' })
+  } catch (e) {
+    logErr('whisper-test error', e)
+    return res.status(500).json({ error: 'whisper failed', details: String(e) })
+  }
+})
+
 const PORT = process.env.PORT || 10000
 app.listen(PORT, () => console.log('Backend listening on', PORT))
