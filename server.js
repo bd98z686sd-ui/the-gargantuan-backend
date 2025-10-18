@@ -10,36 +10,33 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// --- Paths & static ---
+// --- Static uploads directory ---
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads')
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
 app.use('/uploads', express.static(UPLOAD_DIR))
 
-// --- Multer storage for audio uploads ---
+// --- Multer storage (sanitize filename) ---
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOAD_DIR),
   filename: (req, file, cb) => {
-    // sanitize: replace spaces with dashes
     const safe = file.originalname.replace(/\s+/g, '-')
     cb(null, Date.now() + '-' + safe)
   }
 })
 const upload = multer({ storage })
 
-// --- Health root ---
-app.get('/', (req, res) => {
-  res.send('The Gargantuan backend is live.')
-})
+// --- Health ---
+app.get('/', (_req, res) => res.send('The Gargantuan backend is live.'))
 
-// --- List posts (audio/video) newest first ---
+// --- List posts (mp3 + mp4), newest first ---
 app.get('/api/posts', (req, res) => {
   try {
+    const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
     const items = fs.readdirSync(UPLOAD_DIR)
       .filter(f => f.endsWith('.mp3') || f.endsWith('.mp4'))
       .map(filename => {
         const full = path.join(UPLOAD_DIR, filename)
         const stat = fs.statSync(full)
-        const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
         return {
           filename,
           title: filename.replace(/\.[^/.]+$/, ''),
@@ -49,11 +46,11 @@ app.get('/api/posts', (req, res) => {
           date: stat.mtime.toISOString()
         }
       })
-      .sort((a,b) => new Date(b.date) - new Date(a.date))
+      .sort((a, b) => new Date(b.date) - new Date(a.date))
 
     res.json(items)
-  } catch (err) {
-    console.error('posts error', err)
+  } catch (e) {
+    console.error('posts error', e)
     res.status(500).json({ error: 'Could not list uploads' })
   }
 })
@@ -70,12 +67,11 @@ app.post('/api/upload', upload.single('audio'), (req, res) => {
   })
 })
 
-// --- Generate lightweight spectrum video from uploaded audio ---
+// --- Generate spectrum video from audio ---
 app.post('/api/generate-video', async (req, res) => {
   try {
     const { filename, title = 'The Gargantuan' } = req.body || {}
     if (!filename) return res.status(400).json({ error: 'filename required' })
-
     const inPath = path.join(UPLOAD_DIR, filename)
     if (!fs.existsSync(inPath)) return res.status(404).json({ error: 'audio not found' })
 
@@ -87,10 +83,9 @@ app.post('/api/generate-video', async (req, res) => {
     ffmpeg(inPath)
       .outputOptions([
         '-y',
-        '-threads 1',
+        '-threads', '1',
         '-preset', 'ultrafast',
-        '-r', '24',              // lower fps for speed
-        // remove `-t 60` after testing if you want full length
+        '-r', '24'
       ])
       .complexFilter([
         "[0:a]aformat=channel_layouts=stereo," +
@@ -116,8 +111,8 @@ app.post('/api/generate-video', async (req, res) => {
   }
 })
 
-// --- Optional debug: list files ---
-app.get('/api/list', (req, res) => {
+// --- Optional debug ---
+app.get('/api/list', (_req, res) => {
   try {
     const files = fs.readdirSync(UPLOAD_DIR)
     res.json(files)

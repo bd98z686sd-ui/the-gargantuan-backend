@@ -1,6 +1,6 @@
 FROM node:20-slim
 
-# ffmpeg
+# ffmpeg for video generation
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
