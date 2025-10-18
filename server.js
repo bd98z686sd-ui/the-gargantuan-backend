@@ -1,14 +1,4 @@
-// server.js — The Gargantuan Backend v3
-// Features:
-//  - Upload to R2/S3
-//  - Posts feed (videos + audios) from R2
-//  - Spectral square video render (homepage embed)
-//  - Shorts (9:16) with boxed captions
-//  - Masthead + Title Card with auto-contrast vs solid background color
-//  - Thumbnail generator (JPEG) with title overlay
-//  - Admin token header (x-admin-token)
-//  - Duplicate helper fix (readShortJobs vs readVideoJobs)
-
+// server.js — The Gargantuan Backend v3.1 (escape fix + same features)
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -127,13 +117,13 @@ app.get('/api/posts', async (_req,res)=>{
   }catch(e){ logErr('posts',e); res.status(500).json({error:'list failed'}) }
 })
 
-// ---- Styling / brand ----
+// ---- Branding helpers ----
 const BRAND_NAME = process.env.BRAND_NAME || 'The Gargantuan'
-const MASTHEAD_COLOR = process.env.MASTHEAD_COLOR || '#052962' // Guardian blue
+const MASTHEAD_COLOR = process.env.MASTHEAD_COLOR || '#052962'
 const MASTHEAD_HEIGHT = Number(process.env.MASTHEAD_HEIGHT || 180)
 const MASTHEAD_FONT_SIZE = Number(process.env.MASTHEAD_FONT_SIZE || 72)
 const MASTHEAD_X = Number(process.env.MASTHEAD_X || 40)
-// Simple auto-contrast: choose white/black text based on masthead color luminance
+
 function hexToRgb(hex){ const m = /^#?([0-9a-f]{6})$/i.exec(hex||''); if(!m) return {r:5,g:41,b:98}; const n=parseInt(m[1],16); return {r:(n>>16)&255,g:(n>>8)&255,b:n&255} }
 function luminance({r,g,b}){ return 0.2126*r + 0.7152*g + 0.0722*b }
 function contrastTextFor(bgHex){ const Y=luminance(hexToRgb(bgHex)); return Y>140 ? 'black' : 'white' }
@@ -149,14 +139,14 @@ const FPS = Number(process.env.VIDEO_FPS || 24)
 const PRESET = String(process.env.VIDEO_PRESET || 'ultrafast')
 const CRF = String(process.env.VIDEO_CRF || '28')
 
-// ---- Captions config (boxed) ----
+// ---- Captions config ----
 const CAPTIONS_ENABLED = String(process.env.CAPTIONS_ENABLED||'true').toLowerCase()==='true'
 const CAPTION_FONT_SIZE = Number(process.env.CAPTION_FONT_SIZE || 48)
 const CAPTION_COLOR = process.env.CAPTION_COLOR || 'white'
 const CAPTION_BOXCOLOR = process.env.CAPTION_BOXCOLOR || 'black'
 const CAPTION_BOX_OPACITY = Number(process.env.CAPTION_BOX_OPACITY || 0.7)
 const CAPTION_SAFE_Y = Number(process.env.CAPTION_SAFE_Y || 1500)
-const CAPTION_FONT_FILE = process.env.CAPTION_FONT_FILE || '' // optional; otherwise system fallback
+const CAPTION_FONT_FILE = process.env.CAPTION_FONT_FILE || ''
 
 // ---- Shorts & Whisper ----
 const SHORTS_ENABLED = String(process.env.SHORTS_ENABLED||'true').toLowerCase()==='true'
@@ -166,9 +156,17 @@ const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null
 
 function ff(){ ffmpeg.setFfmpegPath(ffmpegStatic || undefined); return ffmpeg }
 
+// --- safe escaping for FFmpeg drawtext ---
+function escFF(s){
+  return String(s||'')
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+}
+
 // ---- Title card & thumbnail helpers ----
 function drawTitleTextChain(chain, title, w, h, bgHex) {
-  const text = title.replace(/[:\\']/g, m => ({':':'\\\\:','\\\\':'\\\\\\\\','\\'':"\\\\'"}[m]))
+  const text = escFF(title)
   const color = contrastTextFor(bgHex)
   const fontfile = CAPTION_FONT_FILE ? `:fontfile='${CAPTION_FONT_FILE}'` : ''
   const y = Math.floor(h*0.4)
@@ -179,14 +177,12 @@ function drawTitleTextChain(chain, title, w, h, bgHex) {
 async function makeTitleCardPng(title, bgHex, w=1080, h=1920){
   const tmp = path.join(os.tmpdir(), `title-${Date.now()}.png`)
   await new Promise((resolve,reject)=>{
-    const filters = [
-      `color=c=${bgHex}:size=${w}x${h}:rate=30[c]`
-    ]
+    const filters = [ `color=c=${bgHex}:size=${w}x${h}:rate=30[c]` ]
     let chain='c'
     const t = drawTitleTextChain(chain, `${BRAND_NAME} — ${title}`, w, h, bgHex)
     filters.push(t); chain=`${chain}t`
     ff()()
-      .input('color=black:s=16x16') // dummy
+      .input('color=black:s=16x16')
       .complexFilter(filters)
       .frames(1)
       .outputOptions('-f','image2')
@@ -199,9 +195,7 @@ async function makeTitleCardPng(title, bgHex, w=1080, h=1920){
 async function makeThumbnailJpg(title, bgHex='#052962', w=1080, h=1080){
   const tmp = path.join(os.tmpdir(), `thumb-${Date.now()}.jpg`)
   await new Promise((resolve,reject)=>{
-    const filters = [
-      `color=c=${bgHex}:size=${w}x${h}:rate=30[c]`
-    ]
+    const filters = [ `color=c=${bgHex}:size=${w}x${h}:rate=30[c]` ]
     let chain='c'
     const t = drawTitleTextChain(chain, title, w, h, bgHex)
     filters.push(t); chain=`${chain}t`
@@ -246,7 +240,6 @@ async function renderSpectralVideo(sourceKey, titleOpt){
 // ---- Whisper transcription (segments) ----
 async function transcribeToSegments(tmpAudioPath){
   if (!openai) {
-    // Fallback mock (keeps pipeline working if key missing)
     return [{ start:0, end:Math.min(10, Number(process.env.SHORTS_MAX_SECONDS||45)), text:'(mock caption)' }]
   }
   const resp = await openai.audio.transcriptions.create({
@@ -259,7 +252,6 @@ async function transcribeToSegments(tmpAudioPath){
   return segs.length?segs:[{ start:0, end:Math.min(8, SHORTS_MAX_SECONDS), text: (resp.text||'').trim()||'(no speech detected)' }]
 }
 
-// Wrap to 2 lines (approx by chars)
 function wrapTwoLines(text, maxChars){
   const m = Number(process.env.CAPTION_MAX_LINE_CHARS||42)
   const limit = maxChars||m
@@ -272,7 +264,6 @@ function wrapTwoLines(text, maxChars){
   }
   return (l2? `${l1}\\n${l2}` : l1) || ''
 }
-
 function esc(s){ return String(s||'').replace(/\\/g,'\\\\').replace(/:/g,'\\:').replace(/'/g,"\\'").replace(/\\n/g,'\\\\n') }
 
 // ---- Shorts render (9:16) ----
@@ -282,22 +273,20 @@ async function renderShort(sourceKey, title){
   await s3GetToFile(sourceKey, tin)
   const segs = await transcribeToSegments(tin)
 
-  const clipDur = Math.min(SHORTS_MAX_SECONDS, Math.max(5, Math.ceil((segs.at(-1)?.end)||15)))
+  const SHORT_DUR = Math.min(SHORTS_MAX_SECONDS, Math.max(5, Math.ceil((segs.at(-1)?.end)||15)))
   const filters = [
     `color=c=white:size=1080x1920:rate=30[bg]`,
-    `[0:a]aformat=channel_layouts=stereo,atrim=0:${clipDur},asetpts=N/SR/TB,showspectrum=s=1080x1200:mode=combined:color=intensity:scale=log,format=yuv420p[v1]`,
+    `[0:a]aformat=channel_layouts=stereo,atrim=0:${SHORT_DUR},asetpts=N/SR/TB,showspectrum=s=1080x1200:mode=combined:color=intensity:scale=log,format=yuv420p[v1]`,
     `[bg][v1]overlay=shortest=1:x=0:y=360,drawbox=x=0:y=0:w=1080:h=${MASTHEAD_HEIGHT}:color=${MASTHEAD_COLOR}@1:t=fill[vbase]`
   ]
   let chain='vbase'
 
-  // Masthead brand text (auto-contrast vs MASTHEAD_COLOR)
   const brandEsc = esc(BRAND_NAME)
   const mastFont = CAPTION_FONT_FILE ? `:fontfile='${CAPTION_FONT_FILE}'` : ''
   const my = Math.max(20, (MASTHEAD_HEIGHT - MASTHEAD_FONT_SIZE - 24))
   filters.push(`${chain};drawtext=text='${brandEsc}':fontsize=${MASTHEAD_FONT_SIZE}:fontcolor=${MASTHEAD_TEXT_COLOR}${mastFont}:x=${MASTHEAD_X}:y=${my}[${chain}m]`)
   chain=`${chain}m`
 
-  // Title card at start (first 1 sec)
   if (title && title.trim().length){
     const titleEsc = esc(`${title}`)
     const tfs = Math.max(52, Math.floor(1080*0.055))
@@ -305,12 +294,11 @@ async function renderShort(sourceKey, title){
     chain=`${chain}t`
   }
 
-  // Captions (boxed, robust readability)
   if (CAPTIONS_ENABLED && segs.length){
     for (const s of segs){
       const t1 = Math.max(0, s.start)
-      const t2 = Math.min(clipDur, Math.max(t1+0.4, s.end))
-      if (t1>=clipDur) break
+      const t2 = Math.min(SHORT_DUR, Math.max(t1+0.4, s.end))
+      if (t1>=SHORT_DUR) break
       const txt = wrapTwoLines(s.text)
       const escTxt = esc(txt)
       const fontSpec = CAPTION_FONT_FILE ? `:fontfile='${CAPTION_FONT_FILE}'` : ''
@@ -321,7 +309,7 @@ async function renderShort(sourceKey, title){
 
   await new Promise((resolve,reject)=>{
     ff()(tin).inputOption('-nostdin')
-      .outputOptions(['-y','-nostdin','-threads','1','-preset','veryfast','-t', String(clipDur),'-r','30','-crf','28'])
+      .outputOptions(['-y','-nostdin','-threads','1','-preset','veryfast','-t', String(SHORT_DUR),'-r','30','-crf','28'])
       .complexFilter(filters)
       .outputOptions(['-map',`[${chain}]`,'-map','0:a','-shortest'])
       .videoCodec('libx264').audioCodec('aac')
@@ -356,12 +344,10 @@ app.post('/api/generate-video', requireAdmin, async (req,res)=>{
   jobs.queue.push(id); await writeVideoJobs(jobs)
   return res.json({ ok:true, id, status:'queued' })
 })
-
 app.get('/api/video/:id/status', async (req,res)=>{
   const jobs = await readVideoJobs(); const j = jobs.items[req.params.id]; if(!j) return res.status(404).json({error:'not found'})
   res.json(j)
 })
-
 app.post('/api/video/process-now', requireAdmin, async (req,res)=>{
   const { id } = req.query; if(!id) return res.status(400).json({error:'id required'})
   const jobs = await readVideoJobs(); const job = jobs.items[id]; if(!job) return res.status(404).json({error:'job not found'})
@@ -387,18 +373,15 @@ app.post('/api/shorts/request', requireAdmin, async (req,res)=>{
   jobs.queue.push(id); await writeShortJobs(jobs)
   res.json({ ok:true, id, status:'queued' })
 })
-
 app.get('/api/shorts/:id/status', async (req,res)=>{
   const jobs = await readShortJobs(); const j = jobs.items[req.params.id]; if(!j) return res.status(404).json({error:'not found'})
   res.json(j)
 })
-
 app.get('/api/shorts', async (_req,res)=>{
   const jobs = await readShortJobs()
   const done = Object.values(jobs.items).filter(j=>j.status==='done').sort((a,b)=>b.createdAt-a.createdAt)
   res.json(done.map(j=>({ id:j.id, source:j.filename, output:j.output, url: j.output?publicUrlForKey(j.output):null, createdAt:j.createdAt })))
 })
-
 app.post('/api/shorts/process-now', requireAdmin, async (req,res)=>{
   const { id } = req.query; if(!id) return res.status(400).json({error:'id required'})
   const jobs = await readShortJobs(); const job = jobs.items[id]; if(!job) return res.status(404).json({error:'job not found'})
