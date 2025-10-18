@@ -35,6 +35,31 @@ app.post('/api/generate-video', async (req, res) => {
 
     ffmpeg.setFfmpegPath(ffmpegStatic);
 
+import fs from "fs";
+import path from "path";
+
+const uploadDir = path.join(process.cwd(), "uploads");
+
+app.get("/api/posts", (req, res) => {
+  try {
+    const files = fs
+      .readdirSync(uploadDir)
+      .filter((file) => file.endsWith(".mp3") || file.endsWith(".mp4"))
+      .sort((a, b) => fs.statSync(path.join(uploadDir, b)).mtime - fs.statSync(path.join(uploadDir, a)).mtime)
+      .map((filename) => ({
+        filename,
+        title: filename.replace(/\\.[^/.]+$/, ""), // strip extension
+        url: `/uploads/${filename}`,
+        date: fs.statSync(path.join(uploadDir, filename)).mtime,
+      }));
+
+    res.json(files);
+  } catch (err) {
+    console.error("Error reading uploads:", err);
+    res.status(500).json({ error: "Could not read uploads" });
+  }
+});
+    
 ffmpeg(inPath)
   // Limit FFmpeg resource use
   .outputOptions([
