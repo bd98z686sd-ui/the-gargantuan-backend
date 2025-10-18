@@ -1,9 +1,9 @@
 {
   "name": "the-gargantuan-backend",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
-  "main": "server.js",
   "type": "module",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
