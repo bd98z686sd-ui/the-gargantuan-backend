@@ -1,4 +1,3 @@
-
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -30,10 +29,6 @@ const S3_ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID
 const S3_SECRET_ACCESS_KEY = process.env.S3_SECRET_ACCESS_KEY
 const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE || ''
 const S3_FORCE_PATH_STYLE = String(process.env.S3_FORCE_PATH_STYLE).toLowerCase() === 'true'
-
-if (!S3_ENDPOINT || !S3_BUCKET) {
-  console.warn('WARN: S3/R2 env not fully set. Set S3_ENDPOINT and S3_BUCKET at minimum.')
-}
 
 const s3 = new S3Client({
   region: S3_REGION,
@@ -153,7 +148,7 @@ app.post('/api/restore', requireAdmin, async (req, res) => {
   }
 })
 
-// Posts (merge R2 listings with metadata, hide soft-deleted)
+// Posts
 app.get('/api/posts', async (_req, res) => {
   try {
     const [vids, auds, meta] = await Promise.all([ s3List('video/'), s3List('audio/'), readMeta() ])
@@ -190,7 +185,7 @@ app.get('/api/posts', async (_req, res) => {
   }
 })
 
-// Generate spectral video
+// Generate spectral video (remove .size() to avoid -vf with -filter_complex clash)
 app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try {
     const { filename } = req.body || {}
@@ -200,7 +195,6 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     await s3GetToFile(filename, tmpIn)
     ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
     await new Promise((resolve, reject) => {
-      // Guardian-style banner + showspectrum in square
       ffmpeg(tmpIn)
         .outputOptions(['-y','-threads','1','-preset','veryfast','-r','24'])
         .complexFilter([
@@ -209,7 +203,7 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
           '[bg][v1]overlay=shortest=1:x=0:y=280,drawbox=x=0:y=0:w=1080:h=160:color=#052962@1:t=fill[v]'
         ])
         .outputOptions(['-map','[v]','-map','0:a','-shortest'])
-        .videoCodec('libx264').audioCodec('aac').size('1080x1080')
+        .videoCodec('libx264').audioCodec('aac')
         .on('end', resolve).on('error', reject).save(tmpOut)
     })
     const base = path.basename(filename).replace(/\.[^/.]+$/, '')
@@ -223,7 +217,7 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
   }
 })
 
-// Shorts (optional worker)
+// Shorts (also remove .size() to avoid clash)
 const openaiKey = process.env.OPENAI_API_KEY
 const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null
 const JOBS_KEY = 'meta/_shorts_jobs.json'
@@ -309,7 +303,7 @@ async function renderShortFromS3(sourceKey, maxSeconds){
       `[bg][v1]overlay=shortest=1:x=0:y=360,drawbox=x=0:y=0:w=1080:h=180:color=#052962@1:t=fill[v]`
     ]
     ffmpeg(tmpIn).outputOptions(['-y','-threads','1','-preset','veryfast','-t', String(seg.duration),'-r','30'])
-      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest']).videoCodec('libx264').audioCodec('aac').size('1080x1920')
+      .complexFilter(filter).outputOptions(['-map','[v]','-map','0:a','-shortest']).videoCodec('libx264').audioCodec('aac')
       .on('end', resolve).on('error', reject).save(tmpOut)
   })
   const base = path.basename(sourceKey).replace(/\.[^/.]+$/, '')
