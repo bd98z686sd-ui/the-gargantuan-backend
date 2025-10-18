@@ -7,6 +7,7 @@ import path from 'path'
 import mime from 'mime-types'
 import ffmpeg from 'fluent-ffmpeg'
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
+import OpenAI from 'openai'
 
 const app = express()
 const PORT = process.env.PORT || 10000
@@ -17,23 +18,32 @@ const DATA_DIR = process.env.DATA_DIR || '/app/data'
 const UPLOAD_DIR = process.env.UPLOAD_DIR || '/app/uploads'
 const USE_S3 = !!process.env.S3_BUCKET
 const S3_BUCKET = process.env.S3_BUCKET
-const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE || '' // e.g. https://your-bucket.r2.dev
+const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE || ''
+const S3_ENDPOINT = process.env.S3_ENDPOINT
+const S3_REGION = process.env.S3_REGION || 'auto'
+const VIDEO_MAX_SECONDS = Number(process.env.VIDEO_MAX_SECONDS || 120)
+const SHORTS_MAX_SECONDS = Number(process.env.SHORTS_MAX_SECONDS || 45)
+const CAPTIONS_ENABLED = String(process.env.CAPTIONS_ENABLED || 'true') === 'true'
+const SHORTS_ENABLED = String(process.env.SHORTS_ENABLED || 'true') === 'true'
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ''
+
 const s3 = USE_S3 ? new S3Client({
-  region: process.env.S3_REGION || 'auto',
-  endpoint: process.env.S3_ENDPOINT, // e.g. https://<accountid>.r2.cloudflarestorage.com
-  credentials: process.env.S3_ACCESS_KEY_ID ? {
+  region: S3_REGION,
+  endpoint: S3_ENDPOINT,
+  credentials: (process.env.S3_ACCESS_KEY_ID && process.env.S3_SECRET_ACCESS_KEY) ? {
     accessKeyId: process.env.S3_ACCESS_KEY_ID,
     secretAccessKey: process.env.S3_SECRET_ACCESS_KEY
   } : undefined,
 }) : null
 
-// ---- MISC ----
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null
+
+// ---- APP ----
 app.use(cors())
 app.use(express.json())
 await fsp.mkdir(DATA_DIR, { recursive: true })
 await fsp.mkdir(UPLOAD_DIR, { recursive: true })
 
-// ---- AUTH ----
 function requireAdmin(req,res,next){
   if((req.headers['x-admin-token']||'') !== ADMIN_TOKEN){
     return res.status(401).json({error:'unauthorized'})
@@ -41,18 +51,14 @@ function requireAdmin(req,res,next){
   next()
 }
 
-// ---- STORAGE HELPERS ----
 const POSTS_JSON = path.join(DATA_DIR,'posts.json')
-async function readPosts(){
-  try{
-    return JSON.parse(await fsp.readFile(POSTS_JSON,'utf-8'))
-  }catch{ return [] }
-}
-async function writePosts(list){
-  await fsp.mkdir(DATA_DIR,{recursive:true})
-  await fsp.writeFile(POSTS_JSON, JSON.stringify(list,null,2))
-}
+async function readPosts(){ try{ return JSON.parse(await fsp.readFile(POSTS_JSON,'utf-8')) } catch{ return [] } }
+async function writePosts(list){ await fsp.mkdir(DATA_DIR,{recursive:true}); await fsp.writeFile(POSTS_JSON, JSON.stringify(list,null,2)) }
 
+function publicUrlFor(key){
+  if(USE_S3) return (S3_PUBLIC_BASE ? (S3_PUBLIC_BASE.replace(/\/$/,'') + '/' + key) : '')
+  return '/uploads/'+key
+}
 async function putFileLocal(buffer, key){
   const filePath = path.join(UPLOAD_DIR, key)
   await fsp.mkdir(path.dirname(filePath),{recursive:true})
@@ -60,13 +66,8 @@ async function putFileLocal(buffer, key){
   return '/uploads/'+key
 }
 async function putFileS3(buffer, key, contentType){
-  const Key = key
-  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key, Body: buffer, ContentType: contentType }))
-  return (S3_PUBLIC_BASE ? (S3_PUBLIC_BASE.replace(/\/$/,'') + '/' + Key) : '') || ('s3://'+S3_BUCKET+'/'+Key)
-}
-function publicUrlFor(key){
-  if(USE_S3) return (S3_PUBLIC_BASE ? (S3_PUBLIC_BASE.replace(/\/$/,'') + '/' + key) : '')
-  return '/uploads/'+key
+  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: buffer, ContentType: contentType }))
+  return publicUrlFor(key)
 }
 
 // static (local only)
@@ -84,17 +85,12 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req,res)=>{
   const contentType = req.file.mimetype || mime.lookup(safe) || 'application/octet-stream'
   const url = USE_S3 ? await putFileS3(req.file.buffer, key, contentType) : await putFileLocal(req.file.buffer, key)
   const posts = await readPosts()
-  const post = {
-    id: key, filename: key,
-    title: safe.replace(/\.[^.]+$/,''),
-    audioUrl: publicUrlFor(key),
-    createdAt: Date.now()
-  }
+  const post = { id:key, filename:key, title: safe.replace(/\.[^.]+$/,''), audioUrl: publicUrlFor(key), createdAt: Date.now() }
   posts.push(post); await writePosts(posts)
   res.json({ filename:key, title: post.title, audioUrl: post.audioUrl })
 })
 
-// ---- POSTS LIST ----
+// ---- POSTS ----
 app.get('/api/posts', async (req,res)=>{
   let list = await readPosts()
   const q = (req.query.q||'').toString().toLowerCase()
@@ -107,141 +103,166 @@ app.get('/api/posts', async (req,res)=>{
   res.json(list)
 })
 
-// ---- EDIT / DELETE ----
 app.patch('/api/posts/:id', requireAdmin, async (req,res)=>{
-  const id = req.params.id
-  const { title } = req.body||{}
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === id)
+  const id = req.params.id; const { title } = req.body||{}
+  const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === id)
   if(i<0) return res.status(404).json({error:'not found'})
-  if(title) posts[i].title = title
-  posts[i].updatedAt = Date.now()
-  await writePosts(posts)
+  if(title) posts[i].title = title; posts[i].updatedAt = Date.now(); await writePosts(posts)
   res.json({ ok:true })
 })
 app.post('/api/posts/:id/title', requireAdmin, async (req,res)=>{
-  const id = req.params.id
-  const { title } = req.body||{}
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === id)
+  const id = req.params.id; const { title } = req.body||{}
+  const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === id)
   if(i<0) return res.status(404).json({error:'not found'})
-  if(title) posts[i].title = title
-  posts[i].updatedAt = Date.now()
-  await writePosts(posts)
+  if(title) posts[i].title = title; posts[i].updatedAt = Date.now(); await writePosts(posts)
   res.json({ ok:true })
 })
-
 app.delete('/api/posts/:id', requireAdmin, async (req,res)=>{
-  const id = req.params.id
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === id)
+  const id = req.params.id; const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === id)
   if(i<0) return res.status(404).json({error:'not found'})
-  posts[i].deleted = true; posts[i].updatedAt = Date.now()
-  await writePosts(posts); res.json({ ok:true })
+  posts[i].deleted = true; posts[i].updatedAt = Date.now(); await writePosts(posts); res.json({ ok:true })
 })
 app.post('/api/posts/:id/delete', requireAdmin, async (req,res)=>{
-  const id = req.params.id
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === id)
+  const id = req.params.id; const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === id)
   if(i<0) return res.status(404).json({error:'not found'})
-  posts[i].deleted = true; posts[i].updatedAt = Date.now()
-  await writePosts(posts); res.json({ ok:true })
+  posts[i].deleted = true; posts[i].updatedAt = Date.now(); await writePosts(posts); res.json({ ok:true })
 })
 app.post('/api/posts/:id/restore', requireAdmin, async (req,res)=>{
-  const id = req.params.id
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === id)
+  const id = req.params.id; const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === id)
   if(i<0) return res.status(404).json({error:'not found'})
-  posts[i].deleted = false; posts[i].updatedAt = Date.now()
-  await writePosts(posts); res.json({ ok:true })
+  posts[i].deleted = false; posts[i].updatedAt = Date.now(); await writePosts(posts); res.json({ ok:true })
 })
 
-// ---- VIDEO GENERATION (basic waveform on solid bg) ----
-async function ensureDir(p){ await fsp.mkdir(p,{recursive:true}) }
-function ffOutPathFor(key, kind='video'){
-  const base = key.replace(/^audio\//,'').replace(/\.[^.]+$/,'')
-  const name = `${base}-${kind}.mp4`
-  return path.join(UPLOAD_DIR, 'video', name)
-}
-function publicVideoUrlFor(key, kind='video'){
-  const base = key.replace(/^audio\//,'').replace(/\.[^.]+$/,'')
-  const vkey = `video/${base}-${kind}.mp4`
-  return publicUrlFor(vkey)
-}
-
-app.post('/api/generate-video', requireAdmin, async (req,res)=>{
-  const { filename } = req.body||{}
-  if(!filename) return res.status(400).json({error:'filename required'})
-  // read audio from local or S3
-  let audioPath = path.join(UPLOAD_DIR, filename)
-  let audioBuffer = null
-  if(USE_S3){
-    // Prefer streaming from S3 to local temp
-    const { Body } = await s3.send(new GetObjectCommand({ Bucket:S3_BUCKET, Key:filename }))
-    audioBuffer = Buffer.from(await Body.transformToByteArray())
-    await ensureDir(path.dirname(audioPath))
-    await fsp.writeFile(audioPath, audioBuffer)
-  } else {
-    if(!fs.existsSync(audioPath)) return res.status(404).json({error:'audio not found'})
+// ---- CAPTIONS (Whisper → SRT) ----
+async function transcribeToSrt(localAudioPath){
+  if(!openai || !CAPTIONS_ENABLED) return null
+  try{
+    const file = await fsp.readFile(localAudioPath)
+    const resp = await openai.audio.transcriptions.create({
+      file, model: "whisper-1", response_format: "srt", temperature: 0.2
+    })
+    // SDK returns text directly for srt
+    return (typeof resp === 'string') ? resp : (resp.text || null)
+  }catch(e){
+    console.error('transcribe error', e)
+    return null
   }
-  const outPath = ffOutPathFor(filename,'video')
-  await ensureDir(path.dirname(outPath))
+}
 
-  // Simple background + waveform
-  await new Promise((resolve, reject)=>{
-    ffmpeg()
-      .input(audioPath)
-      .inputOptions(['-thread_queue_size 512'])
-      .complexFilter([
-        // create colored bg
-        "color=c=0x052962:s=1080x1080:d=30[bg]",
-        // waveform
-        "[0:a]showwaves=s=1080x400:mode=line:rate=25:colors=0xc70000@1.0[w]",
-        // stack
-        "[bg][w]overlay=(W-w)/2:(H-h)/2"
-      ])
+async function ensureLocalAudio(filename){
+  const local = path.join(UPLOAD_DIR, filename)
+  await fsp.mkdir(path.dirname(local), { recursive:true })
+  if(USE_S3){
+    const { Body } = await s3.send(new GetObjectCommand({ Bucket:S3_BUCKET, Key:filename }))
+    const buf = Buffer.from(await Body.transformToByteArray())
+    await fsp.writeFile(local, buf)
+  } else {
+    if(!fs.existsSync(local)) throw new Error('audio not found')
+  }
+  return local
+}
+
+function outKeyFor(baseKey, kind){
+  const base = baseKey.replace(/^audio\//,'').replace(/\.[^.]+$/,'')
+  return `video/${base}-${kind}.mp4`
+}
+
+async function burnWaveformWithCaptions({ localAudio, canvas="1080x1080", kind="video", maxSeconds=0, srtPath=null }){
+  const outLocal = path.join(UPLOAD_DIR, outKeyFor(path.basename(localAudio).startsWith('audio/')?path.basename(localAudio):localAudio.replace(UPLOAD_DIR+'/','audio/'), kind))
+  await fsp.mkdir(path.dirname(outLocal), { recursive:true })
+  const filters = [
+    `color=c=0x052962:s=${canvas}:d=30[bg]`,
+    `[0:a]showwaves=s=${canvas.split('x')[0]}x${Math.min(400, Number(canvas.split('x')[1]) - 680)}:mode=line:rate=25:colors=0xc70000@1.0[w]`,
+    `[bg][w]overlay=(W-w)/2:(H-h)/2[base]`,
+  ]
+  if(srtPath){
+    // burn in subtitles on the composed video
+    const esc = srtPath.replace(/\\/g,'\\\\').replace(/:/g,'\\:').replace(/'/g,"\\'")
+    filters.push(`[base]subtitles='${esc}':force_style='Fontname=Inter,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,Outline=1,Shadow=0,Fontsize=36'[v]`)
+  } else {
+    filters.push(`[base]copy[v]`)
+  }
+
+  await new Promise((resolve,reject)=>{
+    const cmd = ffmpeg().input(localAudio).inputOptions(['-thread_queue_size 512'])
+    cmd.complexFilter(filters, ['v'])
+    if(maxSeconds>0){ cmd.outputOptions(['-t', String(maxSeconds)]) }
+    cmd
       .videoCodec('libx264')
       .audioCodec('aac')
-      .outputOptions([
-        '-shortest',
-        '-preset', 'veryfast',
-        '-crf', '23',
-        '-pix_fmt','yuv420p'
-      ])
-      .save(outPath)
+      .outputOptions(['-shortest','-preset','veryfast','-crf','23','-pix_fmt','yuv420p'])
+      .output(outLocal)
       .on('end', resolve)
       .on('error', reject)
+      .run()
   })
+  return outLocal
+}
 
-  // upload result to S3 if enabled
-  let videoUrl = publicVideoUrlFor(filename,'video')
-  if(USE_S3){
-    const vkey = videoUrl.replace(S3_PUBLIC_BASE.replace(/\/$/, '') + '/', '')
-    const buf = await fsp.readFile(outPath)
-    await s3.send(new PutObjectCommand({ Bucket:S3_BUCKET, Key:vkey, Body:buf, ContentType:'video/mp4' }))
+// ---- Generate full video with captions ----
+app.post('/api/generate-video', requireAdmin, async (req,res)=>{
+  try{
+    const { filename } = req.body||{}
+    if(!filename) return res.status(400).json({error:'filename required'})
+    const localAudio = await ensureLocalAudio(filename)
+    let srtPath = null
+    if(CAPTIONS_ENABLED){
+      const srt = await transcribeToSrt(localAudio)
+      if(srt){
+        srtPath = path.join(UPLOAD_DIR, 'captions', filename.replace(/^audio\//,'').replace(/\.[^.]+$/,'') + '.srt')
+        await fsp.mkdir(path.dirname(srtPath), { recursive:true })
+        await fsp.writeFile(srtPath, srt)
+      }
+    }
+    const outLocal = await burnWaveformWithCaptions({ localAudio, canvas:"1080x1080", kind:"video", maxSeconds: VIDEO_MAX_SECONDS, srtPath })
+    // Upload result if S3
+    let videoKey = outLocal.replace(UPLOAD_DIR + '/', '')
+    let videoUrl = publicUrlFor(videoKey)
+    if(USE_S3){
+      const buf = await fsp.readFile(outLocal)
+      await s3.send(new PutObjectCommand({ Bucket:S3_BUCKET, Key:videoKey, Body:buf, ContentType:'video/mp4' }))
+      videoUrl = publicUrlFor(videoKey)
+    }
+    const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === filename)
+    if(i>=0){ posts[i].videoUrl = videoUrl; posts[i].updatedAt = Date.now(); await writePosts(posts) }
+    res.json({ ok:true, videoUrl })
+  }catch(e){
+    console.error('generate error', e)
+    res.status(500).json({ error:'ffmpeg or captions failed', details: String(e) })
   }
-
-  // record on post
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === filename)
-  if(i>=0){ posts[i].videoUrl = videoUrl; posts[i].updatedAt = Date.now(); await writePosts(posts) }
-
-  res.json({ ok:true, videoUrl })
 })
 
-// very simple placeholder for shorts
+// ---- Generate short (vertical) with captions ----
 app.post('/api/generate-short', requireAdmin, async (req,res)=>{
-  const { filename, maxSeconds=45 } = req.body||{}
-  if(!filename) return res.status(400).json({error:'filename required'})
-  // reuse generate-video but just shorter target name
-  const posts = await readPosts()
-  const i = posts.findIndex(p => (p.id||p.filename) === filename)
-  if(i<0) return res.status(404).json({error:'post not found'})
-  // for brevity, point shortUrl to same generated video in this sample
-  posts[i].shortUrl = posts[i].videoUrl || ''
-  posts[i].updatedAt = Date.now()
-  await writePosts(posts)
-  res.json({ ok:true, shortUrl: posts[i].shortUrl, maxSeconds })
+  try{
+    if(!SHORTS_ENABLED) return res.status(400).json({error:'shorts disabled'})
+    const { filename, maxSeconds } = req.body||{}
+    if(!filename) return res.status(400).json({error:'filename required'})
+    const localAudio = await ensureLocalAudio(filename)
+    let srtPath = null
+    if(CAPTIONS_ENABLED){
+      const srt = await transcribeToSrt(localAudio)
+      if(srt){
+        srtPath = path.join(UPLOAD_DIR, 'captions', filename.replace(/^audio\//,'').replace(/\.[^.]+$/,'') + '.srt')
+        await fsp.mkdir(path.dirname(srtPath), { recursive:true })
+        await fsp.writeFile(srtPath, srt)
+      }
+    }
+    const outLocal = await burnWaveformWithCaptions({ localAudio, canvas:"1080x1920", kind:"short", maxSeconds: Number(maxSeconds||SHORTS_MAX_SECONDS), srtPath })
+    let shortKey = outLocal.replace(UPLOAD_DIR + '/', '')
+    let shortUrl = publicUrlFor(shortKey)
+    if(USE_S3){
+      const buf = await fsp.readFile(outLocal)
+      await s3.send(new PutObjectCommand({ Bucket:S3_BUCKET, Key:shortKey, Body:buf, ContentType:'video/mp4' }))
+      shortUrl = publicUrlFor(shortKey)
+    }
+    const posts = await readPosts(); const i = posts.findIndex(p => (p.id||p.filename) === filename)
+    if(i>=0){ posts[i].shortUrl = shortUrl; posts[i].updatedAt = Date.now(); await writePosts(posts) }
+    res.json({ ok:true, shortUrl })
+  }catch(e){
+    console.error('short error', e)
+    res.status(500).json({ error:'ffmpeg or captions failed', details: String(e) })
+  }
 })
 
 app.get('/', (_req,res)=>res.send('OK'))
