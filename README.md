@@ -1,35 +1,30 @@
-# The Gargantuan Backend — Spectral + R2
+# The Gargantuan Backend (ffmpeg upgrade)
 
-## Required Env (Render → Settings → Environment)
-```
-PORT=10000
-ADMIN_TOKEN=change-me
-PUBLIC_BASE_URL=https://the-gargantuan-backend.onrender.com
+Real spectral video generation with optional burned-in captions (Whisper).
 
-# Shorts (optional)
-OPENAI_API_KEY=sk-...
-SHORTS_ENABLED=true
-SHORTS_MAX_SECONDS=45
+## Deploy on Render (Docker)
+1) Create a **Docker** Web Service on Render from this repo.
+2) No build command needed (Dockerfile included). Start command auto: `node server.js`.
+3) Set env vars:
+   - ADMIN_TOKEN
+   - OPENAI_API_KEY (optional, for captions)
+   - S3_ENDPOINT, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET
+   - S3_PUBLIC_BASE
+   - PORT=10000
+4) Deploy.
 
-# Cloudflare R2 (S3-compatible)
-S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-S3_REGION=auto
-S3_BUCKET=gargantuan
-S3_ACCESS_KEY_ID=...
-S3_SECRET_ACCESS_KEY=...
-S3_PUBLIC_BASE=https://pub-xxxxxxxxxxxxxxxxxxxxxxx.r2.dev
-S3_FORCE_PATH_STYLE=false
-```
 ## Endpoints
-- `GET /api/health`
-- `POST /api/upload` (header `x-admin-token`) form field `audio`
-- `GET /api/posts`
-- `POST /api/meta`  body `{ filename, title, tagline }`
-- `POST /api/soft-delete`  body `{ filenames: string[] }`
-- `POST /api/restore`      body `{ filenames: string[] }`
-- `POST /api/generate-video`  body `{ filename, title? }`
+- `POST /api/upload` (auth) — `audio` or `image` file → R2 + post
+- `GET /api/posts` — list active posts
+- `DELETE /api/posts/:id` (auth) — soft delete
+- `POST /api/posts/:id/restore` (auth) — restore
+- `POST /api/generate-video` (auth) — body `{ filename, title?, whisper? }`
+  - Downloads audio from R2
+  - (Optional) transcribes with Whisper to SRT
+  - Renders 1080x1920 blue canvas + central waveform + title + (optional) subtitles
+  - Uploads MP4 `video/...mp4` to R2 and updates the post
 
 ## Notes
-- Metadata is kept in `meta/_posts.json` (in R2) with `{ items: { [key]: {title,tagline} }, deleted: { [key]: true } }`.
-- Soft-delete hides posts from `/api/posts`. Restore removes the flag.
-- Spectral video uses ffmpeg showspectrum; output stored in `video/<base>.mp4`.
+- Uses **-filter_complex only** to avoid the `-vf/-af` conflict.
+- Font: DejaVu installed via Docker for drawtext/subtitles.
+- If you need captions but don’t want Whisper, set `whisper:false` (default) and it will render without subtitles.
