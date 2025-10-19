@@ -6,7 +6,8 @@ import path from "path";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import ffmpeg from "fluent-ffmpeg";
-import { Configuration, OpenAI } from "openai";
+import OpenAI from "openai";
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
