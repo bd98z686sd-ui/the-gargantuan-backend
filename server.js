@@ -9,7 +9,6 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import { v4 as uuidv4 } from 'uuid'
-import fetch from 'node-fetch'
 import OpenAI from 'openai'
 
 dotenv.config()
@@ -19,12 +18,12 @@ const __dirname = path.dirname(__filename)
 const app = express()
 app.use(cors())
 app.use(morgan('tiny'))
-app.use(express.json({ limit: '10mb' }))
+app.use(express.json({ limit: '15mb' }))
 
 const PORT = process.env.PORT || 10000
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'change-me-strong'
 
-// Data store (JSON file for simplicity)
+// Data store
 const DB_PATH = path.join(__dirname, 'data', 'posts.json')
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
 if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, '[]')
@@ -43,22 +42,22 @@ const s3 = new S3Client({
 const BUCKET = process.env.S3_BUCKET
 const PUBLIC_BASE = process.env.S3_PUBLIC_BASE
 
-// Optional OpenAI
+// Optional OpenAI for captions
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ''
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null
 
 // Middleware
-const auth = (req,res,next)=>{
+const auth = (req, res, next) => {
   const t = req.header('x-admin-token')
   if (!t || t !== ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' })
   next()
 }
 
-// Uploads (memory)
+// Upload
 const upload = multer({ storage: multer.memoryStorage() })
 
 // Health
-app.get('/api/health', (req,res)=> res.json({ ok:true }))
+app.get('/api/health', (req,res)=> res.json({ ok: true }))
 
 // Posts
 app.get('/api/posts', (req,res)=>{
@@ -66,47 +65,77 @@ app.get('/api/posts', (req,res)=>{
   rows.sort((a,b)=> new Date(b.date) - new Date(a.date))
   res.json(rows)
 })
+
 app.post('/api/posts', auth, (req,res)=>{
-  const { title, text, imageUrl, audioUrl, videoUrl } = req.body || {}
+  const { title, text, tagline, imageUrl, audioUrl, videoUrl } = req.body || {}
   const post = {
     id: uuidv4().slice(0,12),
     title: title || 'Untitled',
     text: text || '',
+    tagline: tagline || '',
     imageUrl: imageUrl || '',
     audioUrl: audioUrl || '',
     videoUrl: videoUrl || '',
+    filename: '',
     date: new Date().toISOString(),
     deleted: false
   }
   const rows = readPosts(); rows.push(post); writePosts(rows)
   res.json(post)
 })
+
 app.patch('/api/posts/:id', auth, (req,res)=>{
   const rows = readPosts()
-  const idx = rows.findIndex(p=>p.id === req.params.id)
-  if (idx === -1) return res.status(404).json({error:'not found'})
+  const idx = rows.findIndex(p=>p.id===req.params.id)
+  if (idx === -1) return res.status(404).json({ error: 'not found' })
   rows[idx] = { ...rows[idx], ...req.body }
   writePosts(rows)
   res.json(rows[idx])
 })
+
+app.post('/api/posts/bulk-delete', auth, (req,res)=>{
+  const { ids = [] } = req.body || {}
+  const rows = readPosts()
+  let count = 0
+  for (const id of ids) {
+    const i = rows.findIndex(p=>p.id===id)
+    if (i !== -1 && !rows[i].deleted) { rows[i].deleted = true; count++ }
+  }
+  writePosts(rows)
+  res.json({ ok:true, deleted: count })
+})
+
+app.post('/api/posts/bulk-restore', auth, (req,res)=>{
+  const { ids = [] } = req.body || {}
+  const rows = readPosts()
+  let count = 0
+  for (const id of ids) {
+    const i = rows.findIndex(p=>p.id===id)
+    if (i !== -1 && rows[i].deleted) { rows[i].deleted = false; count++ }
+  }
+  writePosts(rows)
+  res.json({ ok:true, restored: count })
+})
+
 app.delete('/api/posts/:id', auth, (req,res)=>{
   const rows = readPosts()
-  const idx = rows.findIndex(p=>p.id === req.params.id)
-  if (idx === -1) return res.status(404).json({error:'not found'})
+  const idx = rows.findIndex(p=>p.id===req.params.id)
+  if (idx === -1) return res.status(404).json({ error: 'not found' })
   rows[idx].deleted = true
   writePosts(rows)
   res.json({ ok:true })
 })
+
 app.post('/api/posts/:id/restore', auth, (req,res)=>{
   const rows = readPosts()
-  const idx = rows.findIndex(p=>p.id === req.params.id)
-  if (idx === -1) return res.status(404).json({error:'not found'})
+  const idx = rows.findIndex(p=>p.id===req.params.id)
+  if (idx === -1) return res.status(404).json({ error: 'not found' })
   rows[idx].deleted = false
   writePosts(rows)
   res.json({ ok:true })
 })
 
-// Upload audio/image to R2
+// Upload audio/image → R2 + create post
 app.post('/api/upload', auth, upload.single('audio'), async (req,res)=>{
   try {
     if (!req.file) {
@@ -136,6 +165,8 @@ async function handleUpload(req,res, kind){
     audioUrl: kind==='audio'? url : '',
     imageUrl: kind==='image'? url : '',
     videoUrl: '',
+    tagline: '',
+    text: '',
     date: new Date().toISOString(),
     deleted: false
   }
@@ -143,7 +174,7 @@ async function handleUpload(req,res, kind){
   res.json(post)
 }
 
-// === Generate spectral video with optional burned captions ===
+// ===== ffmpeg spectral video with optional Whisper captions =====
 app.post('/api/generate-video', auth, async (req,res)=>{
   try {
     const { filename, title = 'The Gargantuan', whisper = false } = req.body || {}
@@ -153,14 +184,14 @@ app.post('/api/generate-video', auth, async (req,res)=>{
     if (idx === -1) return res.status(404).json({error:'post not found'})
     const audioKey = rows[idx].filename || filename
 
-    // Download audio from R2 to /tmp
+    // Download audio
     const inPath = `/tmp/in-${Date.now()}.mp3`
     await downloadFromR2(audioKey, inPath)
 
-    // Optional: transcribe with Whisper and create SRT
+    // Optional captions
     let srtPath = ''
     if (whisper && openai) {
-      const srt = await transcribeToSrt(inPath, title)
+      const srt = await transcribeToSrt(inPath)
       srtPath = `/tmp/sub-${Date.now()}.srt`
       fs.writeFileSync(srtPath, srt, 'utf8')
     }
@@ -168,43 +199,25 @@ app.post('/api/generate-video', auth, async (req,res)=>{
     const outKey = audioKey.replace(/^audio\//,'video/').replace(/\.[^.]+$/, '.mp4')
     const outPath = `/tmp/out-${Date.now()}.mp4`
 
-    // Build filter_complex (no -vf/-af conflicts)
-    // 1080x1920 portrait, blue bg, centered waveform, title at top.
     const font = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
     const blue = "052962"
-    let drawTitle = `drawtext=fontfile=${font}:text='${escapeDrawText(title)}':x=(w-text_w)/2:y=80:fontsize=64:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2`
-    let vis = "showwaves=s=1080x1080:mode=cline:colors=white,format=rgba"
-    let base = f"color=size=1080x1920:rate=30:color=#{blue}"
-    let filters = f"[0:a]{vis}[vis];{base}[bg];[bg][vis]overlay=(W-w)/2:(H-h)/2,{drawTitle}"
-    if (srtPath) {
-      filters = f"{filters},subtitles='{srtPath.replace(':','\\:')}'"
-    }
+    function esc(s){return s.replace(/([\\:'])/g, m => ({'\\':'\\\\',':':'\\:',"'":"\\'"}[m]))}
 
-    const args = [
-      "-y",
-      "-i", inPath,
-      "-filter_complex", filters,
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-tune", "stillimage",
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac",
-      "-shortest",
-      outPath
-    ]
+    const drawTitle = `drawtext=fontfile=${font}:text='${esc(title)}':x=(w-text_w)/2:y=80:fontsize=64:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2`
+    const vis = "showwaves=s=1080x1080:mode=cline:colors=white,format=rgba"
+    const base = "color=size=1080x1920:rate=30:color=#" + blue
 
+    let filters = `[0:a]${vis}[vis];${base}[bg];[bg][vis]overlay=(W-w)/2:(H-h)/2,${drawTitle}`
+    if (srtPath) filters += `,subtitles='${srtPath.replace(':','\\:')}'`
+
+    const args = ["-y","-i",inPath,"-filter_complex",filters,"-c:v","libx264","-preset","veryfast","-tune","stillimage","-pix_fmt","yuv420p","-c:a","aac","-shortest",outPath]
     await execFfmpeg(args)
 
-    // Upload MP4 to R2
     const mp4 = fs.readFileSync(outPath)
-    await s3.send(new PutObjectCommand({
-      Bucket: BUCKET, Key: outKey, Body: mp4, ContentType: "video/mp4"
-    }))
+    await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: outKey, Body: mp4, ContentType: "video/mp4" }))
 
-    // Update post
     rows[idx].videoUrl = `${PUBLIC_BASE}/${outKey}`
     writePosts(rows)
-
     res.json({ ok:true, videoUrl: rows[idx].videoUrl })
   } catch (e) {
     console.error("generate-video error", e)
@@ -212,65 +225,37 @@ app.post('/api/generate-video', auth, async (req,res)=>{
   }
 })
 
-function escapeDrawText(s){
-  // escape \ : ' for drawtext
-  return s.replace(/([\\:'])/g, m => ({'\\':'\\\\',':':'\\:',"'":"\\'"}[m]))
-}
-
-// Helpers
+import { GetObjectCommand } from '@aws-sdk/client-s3'
 async function downloadFromR2(key, outPath){
-  // Prefer S3 SDK streaming
   const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }))
-  const stream = obj.Body
   await new Promise((resolve, reject)=>{
     const ws = fs.createWriteStream(outPath)
-    stream.on('error', reject)
+    obj.Body.on('error', reject)
     ws.on('finish', resolve)
-    stream.pipe(ws)
+    obj.Body.pipe(ws)
   })
 }
-
 function execFfmpeg(args){
   return new Promise((resolve, reject)=>{
-    const proc = spawn('ffmpeg', args)
-    proc.stderr.on('data', d => process.stdout.write(`[ffmpeg] ${d}`))
-    proc.on('close', code => code === 0 ? resolve() : reject(new Error('ffmpeg exited '+code)))
+    const p = spawn('ffmpeg', args)
+    p.stderr.on('data', d => process.stdout.write(`[ffmpeg] ${d}`))
+    p.on('close', code => code===0 ? resolve() : reject(new Error('ffmpeg exited '+code)))
   })
 }
-
-async function transcribeToSrt(audioPath, title){
-  // Convert local file to FormData for OpenAI Whisper
+async function transcribeToSrt(audioPath){
   if (!openai) return ''
-  const stream = fs.createReadStream(audioPath)
-  const transcript = await openai.audio.transcriptions.create({
-    file: stream,
-    model: "whisper-1",
-    response_format: "verbose_json",
-    timestamp_granularities: ["segment"]
-  })
-  // Build simple SRT
-  let n = 1
-  const lines = []
-  for (const seg of (transcript.segments || [])) {
-    const start = toSrtTS(seg.start || 0)
-    const end = toSrtTS(seg.end || (seg.start+2))
-    lines.push(String(n++))
-    lines.push(`${start} --> ${end}`)
-    lines.push((seg.text || '').trim())
-    lines.push('')
+  const f = fs.createReadStream(audioPath)
+  const resp = await openai.audio.transcriptions.create({ file: f, model: "whisper-1", response_format: "verbose_json", timestamp_granularities: ["segment"] })
+  let i=1, out=[]
+  for (const seg of (resp.segments||[])){
+    const start = toTS(seg.start||0), end = toTS(seg.end|| (seg.start+2))
+    out.push(String(i++)); out.push(`${start} --> ${end}`); out.push((seg.text||'').trim()); out.push('')
   }
-  return lines.join('\n')
+  return out.join('\n')
 }
+function toTS(t){ const h=String(Math.floor(t/3600)).padStart(2,'0'); const m=String(Math.floor((t%3600)/60)).padStart(2,'0'); const s=String(Math.floor(t%60)).padStart(2,'0'); const ms=String(Math.floor((t-Math.floor(t))*1000)).padStart(3,'0'); return `${h}:${m}:${s},${ms}` }
 
-function toSrtTS(t){
-  const h = Math.floor(t/3600).toString().padStart(2,'0')
-  const m = Math.floor((t%3600)/60).toString().padStart(2,'0')
-  const s = Math.floor(t%60).toString().padStart(2,'0')
-  const ms = Math.floor((t - Math.floor(t)) * 1000).toString().padStart(3,'0')
-  return `${h}:${m}:${s},${ms}`
-}
-
-// Shorts (placeholder)
+// Shorts placeholder
 app.get('/api/shorts', (req,res)=> res.json([]))
 
 app.listen(PORT, ()=> console.log('Backend listening on', PORT))
