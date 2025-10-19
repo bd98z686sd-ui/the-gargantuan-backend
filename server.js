@@ -15,6 +15,12 @@ dotenv.config()
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
+// Static hosting and storage fallback
+const LOCAL_PUBLIC_DIR = path.join(__dirname, 'public')
+if (!fs.existsSync(LOCAL_PUBLIC_DIR)) fs.mkdirSync(LOCAL_PUBLIC_DIR, { recursive: true })
+app.use('/public', express.static(LOCAL_PUBLIC_DIR))
+
+
 const app = express()
 app.use(cors())
 app.use(morgan('tiny'))
@@ -256,6 +262,90 @@ function toTS(t){ const h=String(Math.floor(t/3600)).padStart(2,'0'); const m=St
 
 // Shorts placeholder
 app.get('/api/shorts', (req,res)=> res.json([]))
+
+// ===== Shorts generation (square/vertical) =====
+app.post('/api/shorts/create', auth, express.json(), async (req,res)=>{
+  try{
+    const { postId, ratio='vertical', startSec=0, durationSec=20, burnSubtitles=true } = req.body||{}
+    const posts = readPosts()
+    const post = posts.find(p=>p.id===postId)
+    if (!post || !post.audioUrl) return res.status(400).json({ error:'post or audio missing' })
+
+    // Download audio from S3/public
+    const audioUrl = post.audioUrl
+    const audioPath = path.join(__dirname, `tmp-${Date.now()}.mp3`)
+
+    // If S3, stream via GetObject; else fetch from public URL
+    if (audioUrl.startsWith(PUBLIC_BASE) && BUCKET){
+      const key = audioUrl.replace(`${PUBLIC_BASE}/`, '')
+      const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }))
+      await new Promise((resolve,reject)=>{
+        const w = fs.createWriteStream(audioPath)
+        obj.Body.pipe(w); obj.Body.on('error', reject); w.on('finish', resolve)
+      })
+    } else {
+      const https = await import('node:https'); const http = await import('node:http')
+      await new Promise((resolve,reject)=>{
+        const mod = audioUrl.startsWith('https') ? https : http
+        mod.get(audioUrl, r=>{
+          if (r.statusCode!==200) return reject(new Error('download failed'))
+          const w = fs.createWriteStream(audioPath); r.pipe(w); w.on('finish', resolve)
+        }).on('error', reject)
+      })
+    }
+
+    // Optional subtitles via Whisper
+    let srtPath = ''
+    if (burnSubtitles && openai){
+      const srt = await transcribeToSrt(audioPath) || ''
+      if (srt){
+        srtPath = path.join(__dirname, `tmp-${Date.now()}.srt`)
+        fs.writeFileSync(srtPath, srt, 'utf-8')
+      }
+    }
+
+    // Render video
+    const outPath = path.join(__dirname, `tmp-${Date.now()}.mp4`)
+    const size = ratio==='square' ? '1080x1080' : '1080x1920'
+    const ff = ['-y', '-ss', String(startSec), '-t', String(durationSec), '-i', audioPath,
+      '-f', 'lavfi', '-i', `color=c=${ratio==='square'?'#052962':'#052962'}:s=${size}:r=30`,
+      '-filter_complex',
+      srtPath ? `[1:v][0:a]showwaves=s=${size}:mode=line:colors=0xFFFFFF|0xFFFFFF,format=yuv420p[vis];[vis]subtitles=${srtPath}:force_style='FontName=Inter,FontSize=26,PrimaryColour=&HFFFFFF&'` :
+                `showwaves=s=${size}:mode=line:colors=0xFFFFFF|0xFFFFFF,format=yuv420p`,
+      '-shortest','-pix_fmt','yuv420p','-c:v','libx264','-c:a','aac', outPath]
+
+    await new Promise((resolve,reject)=>{
+      const p = spawn('ffmpeg', ff, { stdio:['ignore','inherit','inherit'] })
+      p.on('close', code => code===0? resolve(): reject(new Error('ffmpeg exited '+code)))
+    })
+
+    // Store output
+    let url = ''
+    if (BUCKET){
+      const key = `shorts/${postId}-${Date.now()}.mp4`
+      const body = fs.readFileSync(outPath)
+      await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: body, ContentType:'video/mp4' }))
+      url = `${PUBLIC_BASE}/${key}`
+    } else {
+      const key = `short-${postId}-${Date.now()}.mp4`
+      const outLocal = path.join(LOCAL_PUBLIC_DIR, key)
+      fs.copyFileSync(outPath, outLocal)
+      url = `${PUBLIC_BASE || ''}/public/${key}`
+    }
+
+    // Update post
+    post.videoUrl = url
+    writePosts(posts)
+
+    // Cleanup
+    try{ fs.unlinkSync(audioPath) }catch{}
+    try{ if (srtPath) fs.unlinkSync(srtPath) }catch{}
+    try{ fs.unlinkSync(outPath) }catch{}
+
+    res.json({ ok:true, url })
+  }catch(e){ console.error(e); res.status(500).json({ error:'shorts failed' }) }
+})
+
 // Export helper suggestions
 app.post('/api/export/suggest', express.json(), (req,res)=>{
   const { text='' } = req.body||{}
@@ -268,6 +358,55 @@ app.post('/api/export/suggest', express.json(), (req,res)=>{
   const base = ['#shorts','#ai','#music','#spokenword'].filter(h=>!top.includes(h))
   const hashtags = [...top, ...base].slice(0,10)
   res.json({ title, hashtags })
+})
+
+
+
+// Upload endpoints with S3 fallback to local
+app.post('/api/upload/audio', auth, upload.single('file'), async (req,res)=>{
+  try{
+    const file = req.file
+    if (!file) return res.status(400).json({ error:'no file' })
+    if (!BUCKET){
+      const key = `audio-${Date.now()}-${file.originalname.replace(/\s+/g,'-')}`
+      const outfile = path.join(LOCAL_PUBLIC_DIR, key)
+      fs.writeFileSync(outfile, file.buffer)
+      const url = `${PUBLIC_BASE || ''}/public/${key}`
+      const post = { id: uuidv4().slice(0,12), title: file.originalname.replace(/\.[^.]+$/, ''), audioUrl:url, imageUrl:'', videoUrl:'', tagline:'', text:'', date:new Date().toISOString(), deleted:false }
+      const rows = readPosts(); rows.push(post); writePosts(rows)
+      return res.json(post)
+    } else {
+      const key = `audio/${Date.now()}-${file.originalname.replace(/\s+/g,'-')}`
+      await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: file.buffer, ContentType: file.mimetype }))
+      const url = `${PUBLIC_BASE}/${key}`
+      const post = { id: uuidv4().slice(0,12), title: file.originalname.replace(/\.[^.]+$/, ''), audioUrl:url, imageUrl:'', videoUrl:'', tagline:'', text:'', date:new Date().toISOString(), deleted:false }
+      const rows = readPosts(); rows.push(post); writePosts(rows)
+      return res.json(post)
+    }
+  }catch(e){ console.error(e); res.status(500).json({ error:'upload failed' }) }
+})
+
+app.post('/api/upload/image', auth, upload.single('file'), async (req,res)=>{
+  try{
+    const file = req.file
+    if (!file) return res.status(400).json({ error:'no file' })
+    if (!BUCKET){
+      const key = `image-${Date.now()}-${file.originalname.replace(/\s+/g,'-')}`
+      const outfile = path.join(LOCAL_PUBLIC_DIR, key)
+      fs.writeFileSync(outfile, file.buffer)
+      const url = `${PUBLIC_BASE || ''}/public/${key}`
+      const post = { id: uuidv4().slice(0,12), title: file.originalname.replace(/\.[^.]+$/, ''), audioUrl:'', imageUrl:url, videoUrl:'', tagline:'', text:'', date:new Date().toISOString(), deleted:false }
+      const rows = readPosts(); rows.push(post); writePosts(rows)
+      return res.json(post)
+    } else {
+      const key = `image/${Date.now()}-${file.originalname.replace(/\s+/g,'-')}`
+      await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: file.buffer, ContentType: file.mimetype }))
+      const url = `${PUBLIC_BASE}/${key}`
+      const post = { id: uuidv4().slice(0,12), title: file.originalname.replace(/\.[^.]+$/, ''), audioUrl:'', imageUrl:url, videoUrl:'', tagline:'', text:'', date:new Date().toISOString(), deleted:false }
+      const rows = readPosts(); rows.push(post); writePosts(rows)
+      return res.json(post)
+    }
+  }catch(e){ console.error(e); res.status(500).json({ error:'upload failed' }) }
 })
 
 
