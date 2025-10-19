@@ -225,7 +225,6 @@ app.post('/api/generate-video', auth, async (req,res)=>{
   }
 })
 
-import { GetObjectCommand } from '@aws-sdk/client-s3'
 async function downloadFromR2(key, outPath){
   const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }))
   await new Promise((resolve, reject)=>{
