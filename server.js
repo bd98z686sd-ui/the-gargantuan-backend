@@ -63,7 +63,15 @@ const auth = (req, res, next) => {
 const upload = multer({ storage: multer.memoryStorage() })
 
 // Health
-app.get('/api/health', (req,res)=> res.json({ ok: true }))
+app.get('/api/health', (req,res)=>{
+  res.json({
+    ok: true,
+    storageMode: BUCKET ? 's3' : 'local',
+    bucket: BUCKET || '',
+    publicBase: PUBLIC_BASE || '',
+    requiresToken: !!ADMIN_TOKEN
+  })
+})
 
 // Posts
 app.get('/api/posts', (req,res)=>{
@@ -408,6 +416,68 @@ app.post('/api/upload/image', auth, upload.single('file'), async (req,res)=>{
     }
   }catch(e){ console.error(e); res.status(500).json({ error:'upload failed' }) }
 })
+
+
+
+async function generateSpectralForPost(post){
+  try{
+    if (!post || !post.audioUrl) return
+    const audioUrl = post.audioUrl
+    const audioPath = path.join(__dirname, `auto-${Date.now()}.mp3`)
+    // download
+    if (audioUrl.startsWith(PUBLIC_BASE) && BUCKET){
+      const key = audioUrl.replace(`${PUBLIC_BASE}/`, '')
+      const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }))
+      await new Promise((resolve,reject)=>{
+        const w = fs.createWriteStream(audioPath)
+        obj.Body.pipe(w); obj.Body.on('error', reject); w.on('finish', resolve)
+      })
+    } else {
+      const https = await import('node:https'); const http = await import('node:http')
+      await new Promise((resolve,reject)=>{
+        const mod = audioUrl.startsWith('https') ? https : http
+        mod.get(audioUrl, r=>{
+          if (r.statusCode!==200) return reject(new Error('download failed'))
+          const w = fs.createWriteStream(audioPath); r.pipe(w); w.on('finish', resolve)
+        }).on('error', reject)
+      })
+    }
+    // subtitles
+    let srtPath = ''
+    try{
+      const srt = await transcribeToSrt(audioPath) || ''
+      if (srt){ srtPath = path.join(__dirname, `auto-${Date.now()}.srt`); fs.writeFileSync(srtPath, srt, 'utf-8') }
+    }catch{}
+    // render
+    const outPath = path.join(__dirname, `auto-${Date.now()}.mp4`)
+    const size = '1080x1080'
+    const ff = ['-y','-i',audioPath,'-f','lavfi','-i',`color=c=#052962:s=${size}:r=30`,'-filter_complex',
+      srtPath ? `showwaves=s=${size}:mode=line:colors=0xFFFFFF|0xFFFFFF,format=yuv420p,subtitles=${srtPath}:force_style='FontName=Inter,FontSize=26,PrimaryColour=&HFFFFFF&'` :
+                `showwaves=s=${size}:mode=line:colors=0xFFFFFF|0xFFFFFF,format=yuv420p`,
+      '-shortest','-pix_fmt','yuv420p','-c:v','libx264','-c:a','aac', outPath]
+    await new Promise((resolve,reject)=>{ const p=spawn('ffmpeg', ff, {stdio:['ignore','inherit','inherit']}); p.on('close', c=>c===0?resolve():reject(new Error('ffmpeg '+c))) })
+    // store
+    let url=''
+    if (BUCKET){
+      const key = `videos/${post.id}-${Date.now()}.mp4`
+      const body = fs.readFileSync(outPath)
+      await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: body, ContentType:'video/mp4' }))
+      url = `${PUBLIC_BASE}/${key}`
+    } else {
+      const key = `video-${post.id}-${Date.now()}.mp4`
+      const outLocal = path.join(LOCAL_PUBLIC_DIR, key)
+      fs.copyFileSync(outPath, outLocal)
+      url = `${PUBLIC_BASE || ''}/public/${key}`
+    }
+    // update post
+    const rows = readPosts()
+    const idx = rows.findIndex(p=>p.id===post.id)
+    if (idx>=0){ rows[idx].videoUrl = url; writePosts(rows) }
+    try{ fs.unlinkSync(audioPath) }catch{}
+    try{ if (srtPath) fs.unlinkSync(srtPath) }catch{}
+    try{ fs.unlinkSync(outPath) }catch{}
+  }catch(e){ console.error('auto-generate failed', e) }
+}
 
 
 app.listen(PORT, ()=> console.log('Backend listening on', PORT))
