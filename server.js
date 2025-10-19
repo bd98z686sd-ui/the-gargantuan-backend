@@ -225,6 +225,7 @@ app.post('/api/generate-video', auth, async (req,res)=>{
   }
 })
 
+import { GetObjectCommand } from '@aws-sdk/client-s3'
 async function downloadFromR2(key, outPath){
   const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }))
   await new Promise((resolve, reject)=>{
@@ -256,5 +257,19 @@ function toTS(t){ const h=String(Math.floor(t/3600)).padStart(2,'0'); const m=St
 
 // Shorts placeholder
 app.get('/api/shorts', (req,res)=> res.json([]))
+// Export helper suggestions
+app.post('/api/export/suggest', express.json(), (req,res)=>{
+  const { text='' } = req.body||{}
+  const first = String(text).trim().split(/[.!?\n]/).find(Boolean) || 'New Short: Thoughts & Audio'
+  const title = first.slice(0,80)
+  const words = (text||'').toLowerCase().match(/[a-z0-9]{3,}/g) || []
+  const freq = {}
+  for (const w of words) freq[w]=(freq[w]||0)+1
+  const top = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([w])=>`#${w}`)
+  const base = ['#shorts','#ai','#music','#spokenword'].filter(h=>!top.includes(h))
+  const hashtags = [...top, ...base].slice(0,10)
+  res.json({ title, hashtags })
+})
+
 
 app.listen(PORT, ()=> console.log('Backend listening on', PORT))
