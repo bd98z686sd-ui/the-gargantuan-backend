@@ -147,46 +147,57 @@ app.get('/api/r2/health', async (_req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
+app.get('/api/version', (_req, res) => res.json({ version: '1.3.6' }));
 
 // --- Lists (from R2) ---
 async function listItems(isTrash) {
   const prefix = isTrash ? 'posts/.trash/' : 'posts/';
   const objects = await r2List(prefix);
   const meta = await readMeta();
-  const items = [];
+  const byBase = new Map();
   for (const o of objects) {
     const key = o.Key;
-    if (!key.endsWith('.mp3') && !key.endsWith('.mp4')) continue;
-    const filename = key.split('/').pop();
-    const base = filename.replace(/\.[^/.]+$/, '');
+    const fname = key.split('/').pop();
+    if (!fname) continue;
+    const ext = fname.split('.').pop()?.toLowerCase();
+    if (!['mp3','mp4'].includes(ext)) continue;
+    const base = fname.replace(/\.[^/.]+$/, '');
+    const rec = byBase.get(base) || {
+      id: base, audioUrl: null, videoUrl: null,
+      date: o.LastModified ? new Date(o.LastModified).toISOString() : new Date().toISOString()
+    };
+    if (ext === 'mp3') rec.audioUrl = `${S3_PUBLIC_BASE}/${key}`;
+    if (ext === 'mp4') rec.videoUrl = `${S3_PUBLIC_BASE}/${key}`;
+    rec.date = o.LastModified ? new Date(o.LastModified).toISOString() : rec.date;
+    byBase.set(base, rec);
+  }
+  const items = [];
+  for (const [base, rec] of byBase.entries()) {
+    const title = meta[base]?.title || base;
+    const body  = meta[base]?.body || '';
+    const hasVideo = !!rec.videoUrl;
+    const playUrl = hasVideo ? rec.videoUrl : rec.audioUrl;
     items.push({
-      filename,
-      title: meta[base]?.title || base,
-      body: meta[base]?.body || '',
-      url: `${S3_PUBLIC_BASE}/${key}`,
-      absoluteUrl: `${S3_PUBLIC_BASE}/${key}`,
-      r2Url: `${S3_PUBLIC_BASE}/${key}`,
-      type: filename.endsWith('.mp4') ? 'video' : 'audio',
-      date: o.LastModified ? new Date(o.LastModified).toISOString() : new Date().toISOString(),
+      id: base,
+      filename: hasVideo ? `${base}.mp4` : `${base}.mp3`,
+      title, body,
+      type: hasVideo ? 'video' : 'audio',
+      url: playUrl, playUrl,
+      audioUrl: rec.audioUrl || '', videoUrl: rec.videoUrl || '',
+      date: rec.date,
     });
   }
   items.sort((a, b) => new Date(b.date) - new Date(a.date));
   return items;
 }
 
-app.get('/api/posts', async (req, res) => {
-  try {
-    res.json(await listItems(false));
-  } catch (e) {
-    res.status(500).json({ error: 'list failed' });
-  }
+app.get('/api/posts', async (_req, res) => {
+  try { res.json(await listItems(false)); }
+  catch { res.status(500).json({ error: 'list failed' }); }
 });
-app.get('/api/trash', async (req, res) => {
-  try {
-    res.json(await listItems(true));
-  } catch (e) {
-    res.status(500).json({ error: 'list failed' });
-  }
+app.get('/api/trash', async (_req, res) => {
+  try { res.json(await listItems(true)); }
+  catch { res.status(500).json({ error: 'list failed' }); }
 });
 
 // --- Upload audio (R2 + keep local temp) ---
@@ -197,12 +208,10 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) =
     const baseId = req.file.filename.replace(/\.[^/.]+$/, '');
     const r2Name = `${baseId}.mp3`;
     const r2Url = await r2PutFile(localPath, keyPosts(r2Name), 'audio/mpeg');
-
     const meta = await readMeta();
     meta[baseId] = meta[baseId] || {};
     meta[baseId].title = req.file.originalname || baseId;
     await writeMeta(meta);
-
     res.json({ filename: r2Name, title: meta[baseId].title, r2Url });
   } catch (e) {
     console.error('upload error', e);
@@ -219,10 +228,7 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     const base = filename.replace(/\.[^/.]+$/, '');
     const inPath = path.join(UPLOAD_DIR, filename);
     const r2AudioKey = keyPosts(filename);
-
-    if (!fs.existsSync(inPath)) {
-      await r2DownloadToTemp(r2AudioKey, inPath);
-    }
+    if (!fs.existsSync(inPath)) await r2DownloadToTemp(r2AudioKey, inPath);
 
     const outName = `${base}.mp4`;
     const outPath = path.join(UPLOAD_DIR, outName);
@@ -240,7 +246,7 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
         '-map','[v]','-map','0:a','-shortest'
       ])
       .complexFilter([
-        "[0:a]aformat=channel_layouts=stereo,showspectrum=s=854x480:mode=combined:scale=log:color:intensity:legend=disabled[v]"
+        "[0:a]aformat=channel_layouts=stereo,showspectrum=s=854x480:mode=combined:scale=log:color=intensity:legend=disabled[v]"
       ])
       .on('progress', (p) => {
         if (typeof p.percent === 'number') {
