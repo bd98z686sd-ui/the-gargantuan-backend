@@ -1,251 +1,249 @@
-// server.js (ESM, Node 20)
-// Env: ADMIN_TOKEN, S3_ENDPOINT, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET, S3_PUBLIC_BASE, PORT
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import * as fs from 'node:fs';
-import path from 'node:path';
-import crypto from 'node:crypto';
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegStatic from 'ffmpeg-static';
-import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import express from 'express'
+import cors from 'cors'
+import multer from 'multer'
+import * as fs from 'node:fs'
+import path from 'node:path'
+import ffmpeg from 'fluent-ffmpeg'
+import ffmpegStatic from 'ffmpeg-static'
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const app = express()
+app.use(cors())
+app.use(express.json())
 
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-const upload = multer({ dest: UPLOAD_DIR });
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads')
+const TRASH_DIR = path.join(UPLOAD_DIR, '.trash')
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true })
+if (!fs.existsSync(TRASH_DIR)) fs.mkdirSync(TRASH_DIR, { recursive: true })
+app.use('/uploads', express.static(UPLOAD_DIR))
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const safe = file.originalname.replace(/\s+/g, '-')
+    cb(null, Date.now() + '-' + safe)
+  }
+})
+const upload = multer({ storage })
 
 function requireAdmin(req, res, next) {
-  const expected = process.env.ADMIN_TOKEN || '';
-  const provided = req.get('x-admin-token') || '';
-  if (!expected || provided !== expected) return res.status(401).json({ error: 'unauthorized' });
-  next();
+  const expected = process.env.ADMIN_TOKEN
+  if (!expected) return next()
+  const provided = req.get('x-admin-token')
+  if (provided !== expected) return res.status(401).json({ error: 'unauthorized' })
+  next()
 }
 
-// R2 client
-const S3_ENABLED = !!process.env.S3_ENDPOINT;
-const s3 = S3_ENABLED ? new S3Client({
-  region: 'auto',
-  endpoint: process.env.S3_ENDPOINT,
-  credentials: { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY },
-  forcePathStyle: true,
-}) : null;
-
-const S3_BUCKET = process.env.S3_BUCKET;
-const S3_PUBLIC_BASE = (process.env.S3_PUBLIC_BASE || '').replace(/\/+$/, '');
-const META_KEY = 'posts/_meta.json';
-const keyPosts = (filename) => `posts/${filename}`;
-const keyTrash = (filename) => `posts/.trash/${filename}`;
-
-// R2 helpers
-async function r2PutFile(localPath, key, contentType) {
-  if (!S3_ENABLED) throw new Error('R2 disabled');
-  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: fs.createReadStream(localPath), ContentType: contentType || 'application/octet-stream' }));
-  return S3_PUBLIC_BASE ? `${S3_PUBLIC_BASE}/${key}` : null;
+// --- Metadata helpers ---
+const META_PATH = path.join(UPLOAD_DIR, "_meta.json")
+function readMeta() {
+  try { return JSON.parse(fs.readFileSync(META_PATH, "utf-8")) } catch { return {} }
 }
-async function r2PutText(key, text) {
-  await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: text, ContentType: 'application/json' }));
-}
-async function r2GetText(key) {
-  const obj = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
-  return await obj.Body.transformToString();
-}
-async function r2Copy(srcKey, dstKey) { await s3.send(new CopyObjectCommand({ Bucket: S3_BUCKET, CopySource: `${S3_BUCKET}/${srcKey}`, Key: dstKey })); }
-async function r2Delete(key) { await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key })); }
-async function r2List(prefix='posts/') {
-  const out = await s3.send(new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix }));
-  return (out.Contents || []).map(o => ({ Key:o.Key, LastModified:o.LastModified }));
-}
-async function r2DownloadToTemp(key, localPath){
-  const obj = await s3.send(new GetObjectCommand({ Bucket:S3_BUCKET, Key:key }));
-  await new Promise((resolve, reject)=>{
-    const ws = fs.createWriteStream(localPath);
-    obj.Body.pipe(ws);
-    obj.Body.on('error', reject);
-    ws.on('finish', resolve);
-    ws.on('error', reject);
-  });
+function writeMeta(meta) {
+  fs.writeFileSync(META_PATH, JSON.stringify(meta, null, 2))
 }
 
-// Meta
-async function readMeta(){ try { return JSON.parse(await r2GetText(META_KEY)); } catch { return {}; } }
-async function writeMeta(meta){ await r2PutText(META_KEY, JSON.stringify(meta, null, 2)); }
-
-// Jobs
-const jobs = new Map();
-app.get('/api/jobs/:id', (req,res)=>{
-  const j = jobs.get(req.params.id);
-  if(!j) return res.status(404).json({ error:'not found' });
-  res.json(j);
-});
-
-// Health
-app.get('/', (_req,res)=>res.send('The Gargantuan backend is live.'));
-app.get('/api/version', (_req,res)=>res.json({ version:'1.4.0' }));
-app.get('/api/health', (_req,res)=>res.json({ ok:true }));
-app.get('/api/r2/health', async (_req,res)=>{
-  try{ const list = await r2List('posts/'); res.json({ ok:true, enabled:!!S3_ENABLED, count:list.length }); }
-  catch(e){ res.status(500).json({ ok:false, error:String(e) }); }
-});
-
-// List posts/trash with playUrl + metadata
-async function listItems(isTrash){
-  const prefix = isTrash ? 'posts/.trash/' : 'posts/';
-  const objs = await r2List(prefix);
-  const meta = await readMeta();
-  const byBase = new Map();
-  for(const o of objs){
-    const key = o.Key;
-    const fname = key.split('/').pop();
-    if(!fname) continue;
-    const ext = fname.split('.').pop().toLowerCase();
-    if(!['mp3','mp4'].includes(ext)) continue;
-    const base = fname.replace(/\.[^/.]+$/, '');
-    const rec = byBase.get(base) || { id:base, audioUrl:null, videoUrl:null, date: new Date().toISOString() };
-    if(ext==='mp3') rec.audioUrl = `${S3_PUBLIC_BASE}/${key}`;
-    if(ext==='mp4') rec.videoUrl = `${S3_PUBLIC_BASE}/${key}`;
-    rec.date = o.LastModified ? new Date(o.LastModified).toISOString() : rec.date;
-    byBase.set(base, rec);
-  }
-  const items = [];
-  for(const [base, rec] of byBase.entries()){
-    const title = meta[base]?.title || base;
-    const body  = meta[base]?.body || '';
-    const hasVideo = !!rec.videoUrl;
-    const playUrl = hasVideo ? rec.videoUrl : rec.audioUrl;
-    items.push({ id:base, filename: hasVideo?`${base}.mp4`:`${base}.mp3`, title, body, type: hasVideo?'video':'audio', url: playUrl, playUrl, audioUrl: rec.audioUrl||'', videoUrl: rec.videoUrl||'', date: rec.date });
-  }
-  items.sort((a,b)=> new Date(b.date)-new Date(a.date));
-  return items;
+function baseUrl(req){
+  return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
 }
-app.get('/api/posts', async (_req,res)=>{ try{ res.json(await listItems(false)); } catch{ res.status(500).json({ error:'list failed' }); } });
-app.get('/api/trash', async (_req,res)=>{ try{ res.json(await listItems(true)); } catch{ res.status(500).json({ error:'list failed' }); } });
 
-// Upload audio
-app.post('/api/upload', requireAdmin, upload.single('audio'), async (req,res)=>{
-  try{
-    if(!req.file) return res.status(400).json({ error:'missing audio' });
-    const localPath = req.file.path;
-    const baseId = req.file.filename.replace(/\.[^/.]+$/, '');
-    const r2Name = `${baseId}.mp3`;
-    const r2Url = await r2PutFile(localPath, keyPosts(r2Name), 'audio/mpeg');
-    const meta = await readMeta(); meta[baseId] = meta[baseId] || {}; meta[baseId].title = req.file.originalname || baseId; await writeMeta(meta);
-    res.json({ filename: r2Name, title: meta[baseId].title, r2Url });
-  } catch(e){ console.error('upload error', e); res.status(500).json({ error:'upload failed' }); }
-});
+function listFromDir(dir, req){
+  const meta = readMeta()
+  return fs.readdirSync(dir)
+    .filter(f => f.endsWith('.mp3') || f.endsWith('.mp4'))
+    .map(filename => {
+      const full = path.join(dir, filename)
+      const stat = fs.statSync(full)
+      const baseName = filename.replace(/\.[^/.]+$/, '')
+      const title = meta[baseName]?.title || baseName
+      const isTrash = dir === TRASH_DIR
+      return {
+        filename,
+        title,
+        url: `/uploads/${isTrash ? '.trash/' : ''}${filename}`,
+        absoluteUrl: `${baseUrl(req)}/uploads/${isTrash ? '.trash/' : ''}${filename}`,
+        type: filename.endsWith('.mp4') ? 'video' : 'audio',
+        date: stat.mtime.toISOString()
+      }
+    })
+    .sort((a, b) => new Date(b.date) - new Date(a.date))
+}
 
-// Generate video with safe spectrum + fallback waveform
-app.post('/api/generate-video', requireAdmin, async (req,res)=>{
-  try{
-    const { filename, title='The Gargantuan' } = req.body || {};
-    if(!filename) return res.status(400).json({ error:'filename required' });
-    const base = filename.replace(/\.[^/.]+$/, '');
-    const inPath = path.join(UPLOAD_DIR, filename);
-    const r2AudioKey = keyPosts(filename);
-    if(!fs.existsSync(inPath)) await r2DownloadToTemp(r2AudioKey, inPath);
-    const outName = `${base}.mp4`; const outPath = path.join(UPLOAD_DIR, outName);
+function moveFile(from, to){
+  fs.renameSync(from, to)
+}
 
-    const jobId = crypto.randomUUID(); jobs.set(jobId, { status:'running', progress:1 }); res.status(202).json({ jobId });
+// --- Health ---
+app.get('/', (_req, res) => res.send('The Gargantuan backend is live.'))
+app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-    ffmpeg.setFfmpegPath(ffmpegStatic || undefined);
-    async function runFfmpegWith(filterGraph){
-      return await new Promise((resolve,reject)=>{
-        let last=0;
-        ffmpeg(inPath)
-          .videoCodec('libx264').audioCodec('aac')
-          .outputOptions(['-y','-preset','ultrafast','-r','24','-pix_fmt','yuv420p','-movflags','+faststart','-map','[v]','-map','0:a','-shortest'])
-          .complexFilter([ filterGraph ])
-          .on('progress', (p)=>{
-            if(typeof p.percent==='number'){ last=Math.max(last, Math.min(99, Math.round(p.percent))); const j=jobs.get(jobId)||{}; jobs.set(jobId, { ...j, progress:last }); }
-          })
-          .on('end', ()=> resolve())
-          .on('error', (err)=> reject(err))
-          .save(outPath);
-      });
-    }
-    const FILTER_SAFE_SPECTRUM = "[0:a]aformat=channel_layouts=stereo,showspectrum=s=854x480:mode=combined:legend=disabled[v]";
-    const FILTER_FALLBACK_WAVES = "[0:a]aformat=channel_layouts=stereo,showwaves=s=854x480:mode=line:rate=24,format=yuv420p[v]";
+// --- Lists ---
+app.get('/api/posts', (req, res) => {
+  try { res.json(listFromDir(UPLOAD_DIR, req)) }
+  catch (e) { console.error(e); res.status(500).json({ error: 'Could not list uploads' }) }
+})
+app.get('/api/trash', requireAdmin, (req, res) => {
+  try { res.json(listFromDir(TRASH_DIR, req)) }
+  catch (e) { console.error(e); res.status(500).json({ error: 'Could not list trash' }) }
+})
 
-    try { await runFfmpegWith(FILTER_SAFE_SPECTRUM); }
-    catch(e1){ console.error('spectrum failed, fallback to showwaves:', e1?.message||e1); await runFfmpegWith(FILTER_FALLBACK_WAVES); }
+// --- Upload & generate ---
+app.post('/api/upload', requireAdmin, upload.single('audio'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
+  res.json({ filename: req.file.filename, title: req.file.originalname, url: `/uploads/${req.file.filename}`, absoluteUrl: `${baseUrl(req)}/uploads/${req.file.filename}` })
+})
 
-    try{
-      const r2Url = await r2PutFile(outPath, keyPosts(outName), 'video/mp4');
-      try{ fs.unlinkSync(inPath); }catch{}
-      try{ fs.unlinkSync(outPath); }catch{}
-      const meta = await readMeta(); meta[base] = meta[base] || {}; meta[base].title = title; await writeMeta(meta);
-      const j = jobs.get(jobId) || {}; jobs.set(jobId, { ...j, status:'done', progress:100, result:{ output: outName, r2Url } });
-    }catch(err){ const j=jobs.get(jobId)||{}; jobs.set(jobId, { ...j, status:'error', error:'upload failed' }); }
-  }catch(err){ console.error('generate error', err); res.status(500).json({ error:'server error' }); }
-});
-
-// Edit title/body
-app.patch('/api/posts/:id', requireAdmin, async (req,res)=>{
-  try{
-    const id = req.params.id; const base = id.replace(/\.[^/.]+$/, '');
-    const payload = req.body || {}; const meta = await readMeta(); meta[base] = meta[base] || {};
-    if(payload.title!==undefined) meta[base].title = payload.title;
-    if(payload.body!==undefined) meta[base].body = payload.body;
-    await writeMeta(meta);
-    res.json({ ok:true, id:base, title: meta[base].title, body: meta[base].body || '' });
-  }catch{ res.status(500).json({ error:'update failed' }); }
-});
-
-// Delete/restore/hard delete
-app.delete('/api/posts/:id', requireAdmin, async (req,res)=>{
-  try{
-    const id = req.params.id; const base = id.replace(/\.[^/.]+$/, '');
-    const files = [`${base}.mp3`, `${base}.mp4`]; const moved=[];
-    for(const f of files){ try{ await r2Copy(keyPosts(f), keyTrash(f)); await r2Delete(keyPosts(f)); moved.push(f); }catch{} }
-    res.json({ ok:true, moved });
-  }catch{ res.status(500).json({ error:'soft delete failed' }); }
-});
-app.post('/api/posts/:id/restore', requireAdmin, async (req,res)=>{
-  try{
-    const id = req.params.id; const base = id.replace(/\.[^/.]+$/, '');
-    const files = [`${base}.mp3`, `${base}.mp4`]; const restored=[];
-    for(const f of files){ try{ await r2Copy(keyTrash(f), keyPosts(f)); await r2Delete(keyTrash(f)); restored.push(f); }catch{} }
-    res.json({ ok:true, restored });
-  }catch{ res.status(500).json({ error:'restore failed' }); }
-});
-app.delete('/api/trash/:id', requireAdmin, async (req,res)=>{
-  try{
-    const id = req.params.id; const base = id.replace(/\.[^/.]+$/, '');
-    const files = [`${base}.mp3`, `${base}.mp4`]; const deleted=[];
-    for(const f of files){ try{ await r2Delete(keyTrash(f)); deleted.push(f); }catch{} }
-    res.json({ ok:true, deleted });
-  }catch{ res.status(500).json({ error:'hard delete failed' }); }
-});
-
-// Image upload
-
-// --- Create text/image post ---
-app.post('/api/create-post', requireAdmin, async (req, res) => {
+app.post('/api/generate-video', requireAdmin, async (req, res) => {
   try {
-    const { title='Untitled', body='', imageUrl='' } = req.body || {};
-    const id = String(Date.now());
-    const meta = await readMeta();
-    meta[id] = { title, body, imageUrl };
-    await writeMeta(meta);
-    res.json({ ok:true, id, title, body, imageUrl });
-  } catch (e) {
-    res.status(500).json({ error:'create post failed' });
+    const { filename, title = 'The Gargantuan' } = req.body || {}
+    if (!filename) return res.status(400).json({ error: 'filename required' })
+    const inPath = path.join(UPLOAD_DIR, filename)
+    if (!fs.existsSync(inPath)) return res.status(404).json({ error: 'audio not found' })
+    const outName = filename.replace(/\.[^/.]+$/, '') + '.mp4'
+    const outPath = path.join(UPLOAD_DIR, outName)
+    ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
+    ffmpeg(inPath)
+      .outputOptions(['-y', '-threads', '1', '-preset', 'ultrafast', '-r', '24'])
+      .complexFilter(["[0:a]aformat=channel_layouts=stereo,showspectrum=s=480x270:mode=combined:scale=log:color=intensity,format=yuv420p[v]"])
+      .outputOptions(['-map', '[v]', '-map', '0:a', '-shortest'])
+      .videoCodec('libx264')
+      .audioCodec('aac')
+      .output(outPath)
+      .on('end', () => res.json({ output: `/uploads/${outName}`, absoluteUrl: `${baseUrl(req)}/uploads/${outName}` }))
+      .on('error', (err) => { console.error('ffmpeg error', err); res.status(500).json({ error: 'ffmpeg failed', details: String(err) }) })
+      .run()
+  } catch (err) {
+    console.error('generate error', err)
+    res.status(500).json({ error: 'server error', details: String(err) })
   }
-});
+})
 
-app.post('/api/images/upload', requireAdmin, upload.single('image'), async (req,res)=>{
-  try{
-    if(!req.file) return res.status(400).json({ error:'missing image' });
-    const ext = String(req.file.originalname.split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g,'') || 'png';
-    const key = `images/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`;
-    const url = await r2PutFile(req.file.path, key, req.file.mimetype || 'application/octet-stream');
-    try{ fs.unlinkSync(req.file.path); }catch{}
-    res.json({ ok:true, url, key });
-  }catch(e){ console.error('image upload error', e); res.status(500).json({ error:'image upload failed' }); }
-});
+// --- Edit title ---
+app.patch('/api/posts/:id', requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id
+    const baseName = id.replace(/\.[^/.]+$/, '')
+    const body = req.body || {}
+    const meta = readMeta()
+    if (body.title && typeof body.title === 'string') {
+      meta[baseName] = { ...(meta[baseName] || {}), title: body.title }
+      writeMeta(meta)
+      return res.json({ ok: true, id: baseName, title: body.title })
+    }
+    res.status(400).json({ error: 'Nothing to update' })
+  } catch (e) {
+    console.error('patch error', e)
+    res.status(500).json({ error: 'update failed' })
+  }
+})
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, ()=> console.log('Backend listening on', PORT));
+// --- Soft delete to .trash ---
+app.delete('/api/posts/:id', requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id
+    const baseName = id.replace(/\.[^/.]+$/, '')
+    const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+    let moved = []
+    for (const f of candidates) {
+      const src = path.join(UPLOAD_DIR, f)
+      const dst = path.join(TRASH_DIR, f)
+      if (fs.existsSync(src)) { moveFile(src, dst); moved.push(f) }
+    }
+    if (moved.length === 0) return res.status(404).json({ error: 'not found' })
+    res.json({ ok: true, moved })
+  } catch (e) {
+    console.error('soft delete error', e)
+    res.status(500).json({ error: 'delete failed' })
+  }
+})
+
+// --- Restore from trash ---
+app.post('/api/posts/:id/restore', requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id
+    const baseName = id.replace(/\.[^/.]+$/, '')
+    const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+    let restored = []
+    for (const f of candidates) {
+      const src = path.join(TRASH_DIR, f)
+      const dst = path.join(UPLOAD_DIR, f)
+      if (fs.existsSync(src)) { moveFile(src, dst); restored.push(f) }
+    }
+    if (restored.length === 0) return res.status(404).json({ error: 'not found in trash' })
+    res.json({ ok: true, restored })
+  } catch (e) {
+    console.error('restore error', e)
+    res.status(500).json({ error: 'restore failed' })
+  }
+})
+
+// --- Hard delete from trash ---
+app.delete('/api/trash/:id', requireAdmin, (req, res) => {
+  try {
+    const id = req.params.id
+    const baseName = id.replace(/\.[^/.]+$/, '')
+    const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+    let removed = []
+    for (const f of candidates) {
+      const p = path.join(TRASH_DIR, f)
+      if (fs.existsSync(p)) { fs.unlinkSync(p); removed.push(f) }
+    }
+    // optionally also remove metadata
+    const meta = readMeta()
+    if (meta[baseName]) { delete meta[baseName]; writeMeta(meta) }
+    if (removed.length === 0) return res.status(404).json({ error: 'not found in trash' })
+    res.json({ ok: true, removed })
+  } catch (e) {
+    console.error('hard delete error', e)
+    res.status(500).json({ error: 'hard delete failed' })
+  }
+})
+
+// --- Bulk operations ---
+app.post('/api/posts/bulk-delete', requireAdmin, (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : []
+    if (!ids.length) return res.status(400).json({ error: 'ids required' })
+    let results = []
+    for (const id of ids) {
+      const baseName = id.replace(/\.[^/.]+$/, '')
+      const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+      let moved = []
+      for (const f of candidates) {
+        const src = path.join(UPLOAD_DIR, f)
+        const dst = path.join(TRASH_DIR, f)
+        if (fs.existsSync(src)) { moveFile(src, dst); moved.push(f) }
+      }
+      results.push({ id: baseName, moved })
+    }
+    res.json({ ok: true, results })
+  } catch (e) {
+    console.error('bulk delete error', e)
+    res.status(500).json({ error: 'bulk delete failed' })
+  }
+})
+
+app.post('/api/trash/bulk-restore', requireAdmin, (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : []
+    if (!ids.length) return res.status(400).json({ error: 'ids required' })
+    let results = []
+    for (const id of ids) {
+      const baseName = id.replace(/\.[^/.]+$/, '')
+      const candidates = [`${baseName}.mp3`, `${baseName}.mp4`]
+      let restored = []
+      for (const f of candidates) {
+        const src = path.join(TRASH_DIR, f)
+        const dst = path.join(UPLOAD_DIR, f)
+        if (fs.existsSync(src)) { moveFile(src, dst); restored.push(f) }
+      }
+      results.push({ id: baseName, restored })
+    }
+    res.json({ ok: true, results })
+  } catch (e) {
+    console.error('bulk restore error', e)
+    res.status(500).json({ error: 'bulk restore failed' })
+  }
+})
+
+const PORT = process.env.PORT || 10000
+app.listen(PORT, () => console.log('Backend listening on', PORT))
