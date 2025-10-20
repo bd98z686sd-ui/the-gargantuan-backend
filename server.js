@@ -5,10 +5,54 @@ import * as fs from 'node:fs'
 import path from 'node:path'
 import ffmpeg from 'fluent-ffmpeg'
 import ffmpegStatic from 'ffmpeg-static'
+import { S3Client, PutObjectCommand, ListObjectsV2Command, CopyObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
+import crypto from 'node:crypto'
 
 const app = express()
 app.use(cors())
 app.use(express.json())
+
+const S3_ENABLED = !!process.env.S3_ENDPOINT
+const s3 = S3_ENABLED ? new S3Client({
+  region: 'auto',
+  endpoint: process.env.S3_ENDPOINT,
+  credentials: { accessKeyId: process.env.S3_ACCESS_KEY_ID, secretAccessKey: process.env.S3_SECRET_ACCESS_KEY },
+  forcePathStyle: true
+}) : null
+const S3_BUCKET = process.env.S3_BUCKET
+const S3_PUBLIC_BASE = process.env.S3_PUBLIC_BASE
+
+function keyPosts(filename){ return `posts/${filename}` }
+function keyTrash(filename){ return `posts/.trash/${filename}` }
+const META_KEY = 'posts/_meta.json'
+
+async function r2PutStream(stream, key, contentType){
+  if (!S3_ENABLED) return null
+  await s3.send(new PutObjectCommand({ Bucket:S3_BUCKET, Key:key, Body:stream, ContentType:contentType }))
+  return S3_PUBLIC_BASE ? `${S3_PUBLIC_BASE}/${key}` : null
+}
+async function r2PutFile(localPath, key, contentType){
+  const rs = fs.createReadStream(localPath)
+  return r2PutStream(rs, key, contentType)
+}
+async function r2List(prefix='posts/'){
+  const out = await s3.send(new ListObjectsV2Command({ Bucket:S3_BUCKET, Prefix:prefix }))
+  return (out.Contents||[]).map(o=>o.Key)
+}
+async function r2Copy(srcKey, dstKey){
+  await s3.send(new CopyObjectCommand({ Bucket:S3_BUCKET, CopySource:`${S3_BUCKET}/${srcKey}`, Key:dstKey }))
+}
+async function r2Delete(key){
+  await s3.send(new DeleteObjectCommand({ Bucket:S3_BUCKET, Key:key }))
+}
+async function r2GetText(key){
+  const obj = await s3.send(new GetObjectCommand({ Bucket:S3_BUCKET, Key:key }))
+  return await obj.Body.transformToString()
+}
+async function r2PutText(key, text){
+  await s3.send(new PutObjectCommand({ Bucket:S3_BUCKET, Key:key, Body:text, ContentType:'application/json' }))
+}
+
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads')
 const TRASH_DIR = path.join(UPLOAD_DIR, '.trash')
@@ -34,40 +78,42 @@ function requireAdmin(req, res, next) {
 }
 
 // --- Metadata helpers ---
-const META_PATH = path.join(UPLOAD_DIR, "_meta.json")
-function readMeta() {
-  try { return JSON.parse(fs.readFileSync(META_PATH, "utf-8")) } catch { return {} }
+// --- Metadata helpers (stored in R2) ---
+async function readMeta() {
+  if (!S3_ENABLED) return {}
+  try { return JSON.parse(await r2GetText(META_KEY)) } catch { return {} }
 }
-function writeMeta(meta) {
-  fs.writeFileSync(META_PATH, JSON.stringify(meta, null, 2))
+async function writeMeta(meta) {
+  await r2PutText(META_KEY, JSON.stringify(meta, null, 2))
 }
 
 function baseUrl(req){
   return process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`
 }
 
-function listFromDir(dir, req){
-  const meta = readMeta()
-  return fs.readdirSync(dir)
-    .filter(f => f.endsWith('.mp3') || f.endsWith('.mp4'))
-    .map(filename => {
-      const full = path.join(dir, filename)
-      const stat = fs.statSync(full)
-      const baseName = filename.replace(/\.[^/.]+$/, '')
-      const title = meta[baseName]?.title || baseName
-      const isTrash = dir === TRASH_DIR
-      return {
-        filename,
-        title,
-        url: `/uploads/${isTrash ? '.trash/' : ''}${filename}`,
-        absoluteUrl: `${baseUrl(req)}/uploads/${isTrash ? '.trash/' : ''}${filename}`,
-        type: filename.endsWith('.mp4') ? 'video' : 'audio',
-        date: stat.mtime.toISOString()
-      }
+async function listFromDir(isTrash, req){
+  const prefix = isTrash ? 'posts/.trash/' : 'posts/'
+  const keys = await r2List(prefix)
+  const meta = await readMeta()
+  const items = []
+  for (const key of keys){
+    if (!key.endsWith('.mp3') && !key.endsWith('.mp4')) continue
+    const filename = key.split('/').pop()
+    const baseName = filename.replace(/\.[^/.]+$/, '')
+    const title = meta[baseName]?.title || baseName
+    items.push({
+      filename,
+      title,
+      url: `${S3_PUBLIC_BASE}/${key}`,
+      absoluteUrl: `${S3_PUBLIC_BASE}/${key}`,
+      r2Url: `${S3_PUBLIC_BASE}/${key}`,
+      type: filename.endsWith('.mp4') ? 'video' : 'audio',
+      date: new Date().toISOString()
     })
-    .sort((a, b) => new Date(b.date) - new Date(a.date))
+  }
+  items.sort((a,b)=> new Date(b.date)-new Date(a.date))
+  return items
 }
-
 function moveFile(from, to){
   fs.renameSync(from, to)
 }
@@ -76,14 +122,12 @@ function moveFile(from, to){
 app.get('/', (_req, res) => res.send('The Gargantuan backend is live.'))
 app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-// --- Lists ---
-app.get('/api/posts', (req, res) => {
-  try { res.json(listFromDir(UPLOAD_DIR, req)) }
-  catch (e) { console.error(e); res.status(500).json({ error: 'Could not list uploads' }) }
+// --- Lists
+app.get('/api/posts', async (req, res) => {
+  try { res.json(await listFromDir(false, req)) } catch(e){ console.error(e); res.status(500).json({ error: 'list failed' }) }
 })
-app.get('/api/trash', requireAdmin, (req, res) => {
-  try { res.json(listFromDir(TRASH_DIR, req)) }
-  catch (e) { console.error(e); res.status(500).json({ error: 'Could not list trash' }) }
+app.get('/api/trash', async (req, res) => {
+  try { res.json(await listFromDir(true, req)) } catch(e){ console.error(e); res.status(500).json({ error: 'list failed' }) }
 })
 
 // --- Upload & generate ---
@@ -247,3 +291,17 @@ app.post('/api/trash/bulk-restore', requireAdmin, (req, res) => {
 
 const PORT = process.env.PORT || 10000
 app.listen(PORT, () => console.log('Backend listening on', PORT))
+
+// --- Image upload to R2 ---
+app.post('/api/images/upload', requireAdmin, multer({ dest: UPLOAD_DIR }).single('image'), async (req, res) => {
+  try{
+    if (!req.file) return res.status(400).json({ error: 'missing image' })
+    const ext = (req.file.originalname.split('.').pop()||'png').toLowerCase()
+    const safe = ext.replace(/[^a-z0-9]/g,'') || 'png'
+    const key = `images/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${safe}`
+    const ct = req.file.mimetype || 'application/octet-stream'
+    const url = await r2PutFile(req.file.path, key, ct)
+    fs.existsSync(req.file.path) && fs.unlinkSync(req.file.path)
+    res.json({ ok:true, url, key })
+  }catch(e){ console.error('image upload error', e); res.status(500).json({ error: 'image upload failed' }) }
+})
