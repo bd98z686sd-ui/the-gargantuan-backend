@@ -347,3 +347,48 @@ const jobs = new Map();
 function newJob(){ const id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())) ; jobs.set(id,{ status:'queued', progress:0 }); return id; }
 function setJob(id, patch){ const j = jobs.get(id)||{}; jobs.set(id,{ ...j, ...patch }); }
 app.get('/api/jobs/:id', (req,res)=>{ const j = jobs.get(req.params.id); if(!j) return res.status(404).json({ error:'not found' }); res.json(j); });
+
+app.post('/api/generate-video', requireAdmin, async (req, res) => {
+  const { filename, title = 'The Gargantuan' } = req.body || {}
+  if (!filename) return res.status(400).json({ error: 'filename required' })
+  const inPath = path.join(UPLOAD_DIR, filename)
+  if (!fs.existsSync(inPath)) return res.status(404).json({ error: 'audio not found' })
+  const outName = filename.replace(/\.[^/.]+$/, '') + '.mp4'
+  const outPath = path.join(UPLOAD_DIR, outName)
+
+  const jobId = (globalThis.crypto?.randomUUID?.() || String(Date.now()))
+  jobs.set(jobId, { status:'running', progress:1 })
+  res.status(202).json({ jobId })
+
+  try{
+    ffmpeg.setFfmpegPath(ffmpegStatic || undefined)
+    let lastPercent = 0
+    ffmpeg(inPath)
+      .outputOptions(['-y', '-threads', '1', '-preset', 'ultrafast', '-r', '24'])
+      .complexFilter(["[0:a]aformat=channel_layouts=stereo,showspectrum=s=480x270:mode=combined:scale=log:color=intensity:legend=disabled,format=yuv420p[v]"])
+      .output(outPath)
+      .on('progress', (p)=>{
+        if (typeof p.percent === 'number'){ lastPercent = Math.max(lastPercent, Math.min(99, Math.round(p.percent))) }
+        const j = jobs.get(jobId)||{}; jobs.set(jobId, { ...j, progress:lastPercent })
+      })
+      .on('end', async ()=>{
+        try{
+          const r2Url = await r2PutFile(outPath, keyPosts(outName), 'video/mp4')
+          try{ fs.unlinkSync(inPath) }catch{}
+          try{ fs.unlinkSync(outPath) }catch{}
+          const meta = await readMeta(); const base = outName.replace(/\.[^/.]+$/, '')
+          meta[base] = meta[base] || {}; meta[base].title = title
+          await writeMeta(meta)
+          const j = jobs.get(jobId)||{}; jobs.set(jobId, { ...j, status:'done', progress:100, result:{ output: outName, r2Url } })
+        }catch(err){
+          const j = jobs.get(jobId)||{}; jobs.set(jobId, { ...j, status:'error', error: 'upload failed' })
+        }
+      })
+      .on('error', (err)=>{
+        const j = jobs.get(jobId)||{}; jobs.set(jobId, { ...j, status:'error', error: 'ffmpeg failed' })
+      })
+      .run()
+  }catch(err){
+    const j = jobs.get(jobId)||{}; jobs.set(jobId, { ...j, status:'error', error:'server error' })
+  }
+})
