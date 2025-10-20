@@ -84,7 +84,7 @@ app.get('/api/jobs/:id', (req,res)=>{
 
 // Health
 app.get('/', (_req,res)=>res.send('The Gargantuan backend is live.'));
-app.get('/api/version', (_req,res)=>res.json({ version:'1.3.7' }));
+app.get('/api/version', (_req,res)=>res.json({ version:'1.4.0' }));
 app.get('/api/health', (_req,res)=>res.json({ ok:true }));
 app.get('/api/r2/health', async (_req,res)=>{
   try{ const list = await r2List('posts/'); res.json({ ok:true, enabled:!!S3_ENABLED, count:list.length }); }
@@ -221,6 +221,21 @@ app.delete('/api/trash/:id', requireAdmin, async (req,res)=>{
 });
 
 // Image upload
+
+// --- Create text/image post ---
+app.post('/api/create-post', requireAdmin, async (req, res) => {
+  try {
+    const { title='Untitled', body='', imageUrl='' } = req.body || {};
+    const id = String(Date.now());
+    const meta = await readMeta();
+    meta[id] = { title, body, imageUrl };
+    await writeMeta(meta);
+    res.json({ ok:true, id, title, body, imageUrl });
+  } catch (e) {
+    res.status(500).json({ error:'create post failed' });
+  }
+});
+
 app.post('/api/images/upload', requireAdmin, upload.single('image'), async (req,res)=>{
   try{
     if(!req.file) return res.status(400).json({ error:'missing image' });
