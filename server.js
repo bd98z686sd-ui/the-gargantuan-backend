@@ -189,12 +189,11 @@ app.get('/api/trash', async (req, res) => {
   }
 });
 
-// --- Upload audio (keeps local temp, also mirrors to R2) ---
+// --- Upload audio (R2 + keep local temp) ---
 app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'missing audio' });
     const localPath = req.file.path;
-    // Normalize to .mp3 extension (frontend enforces MP3)
     const baseId = req.file.filename.replace(/\.[^/.]+$/, '');
     const r2Name = `${baseId}.mp3`;
     const r2Url = await r2PutFile(localPath, keyPosts(r2Name), 'audio/mpeg');
@@ -204,7 +203,6 @@ app.post('/api/upload', requireAdmin, upload.single('audio'), async (req, res) =
     meta[baseId].title = req.file.originalname || baseId;
     await writeMeta(meta);
 
-    // Keep local file for generate step; it will be removed after encoding.
     res.json({ filename: r2Name, title: meta[baseId].title, r2Url });
   } catch (e) {
     console.error('upload error', e);
@@ -222,7 +220,6 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     const inPath = path.join(UPLOAD_DIR, filename);
     const r2AudioKey = keyPosts(filename);
 
-    // Ensure local audio exists (download from R2 if needed)
     if (!fs.existsSync(inPath)) {
       await r2DownloadToTemp(r2AudioKey, inPath);
     }
@@ -235,35 +232,32 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
     res.status(202).json({ jobId });
 
     ffmpeg.setFfmpegPath(ffmpegStatic || undefined);
-    let lastPercent = 0;
+    let last = 0;
     ffmpeg(inPath)
-      .outputOptions(['-y', '-threads', '1', '-preset', 'ultrafast', '-r', '24'])
-      .complexFilter([
-        "[0:a]aformat=channel_layouts=stereo,showspectrum=s=480x270:mode=combined:scale=log:color=intensity:legend=disabled,format=yuv420p[v]",
+      .videoCodec('libx264').audioCodec('aac')
+      .outputOptions([
+        '-y','-preset','ultrafast','-r','24','-pix_fmt','yuv420p','-movflags','+faststart',
+        '-map','[v]','-map','0:a','-shortest'
       ])
-      .output(outPath)
+      .complexFilter([
+        "[0:a]aformat=channel_layouts=stereo,showspectrum=s=854x480:mode=combined:scale=log:color:intensity:legend=disabled[v]"
+      ])
       .on('progress', (p) => {
         if (typeof p.percent === 'number') {
-          lastPercent = Math.max(lastPercent, Math.min(99, Math.round(p.percent)));
+          last = Math.max(last, Math.min(99, Math.round(p.percent)));
           const j = jobs.get(jobId) || {};
-          jobs.set(jobId, { ...j, progress: lastPercent });
+          jobs.set(jobId, { ...j, progress: last });
         }
       })
       .on('end', async () => {
         try {
           const r2Url = await r2PutFile(outPath, keyPosts(outName), 'video/mp4');
-          try {
-            fs.unlinkSync(inPath);
-          } catch {}
-          try {
-            fs.unlinkSync(outPath);
-          } catch {}
-
+          try { fs.unlinkSync(inPath); } catch {}
+          try { fs.unlinkSync(outPath); } catch {}
           const meta = await readMeta();
           meta[base] = meta[base] || {};
           meta[base].title = title;
           await writeMeta(meta);
-
           const j = jobs.get(jobId) || {};
           jobs.set(jobId, { ...j, status: 'done', progress: 100, result: { output: outName, r2Url } });
         } catch (err) {
@@ -277,7 +271,8 @@ app.post('/api/generate-video', requireAdmin, async (req, res) => {
         const j = jobs.get(jobId) || {};
         jobs.set(jobId, { ...j, status: 'error', error: 'ffmpeg failed' });
       })
-      .run();
+      .save(outPath);
+
   } catch (err) {
     console.error('generate error', err);
     res.status(500).json({ error: 'server error' });
@@ -301,7 +296,7 @@ app.patch('/api/posts/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// --- Soft delete / restore / hard delete (R2 prefixes) ---
+// --- Soft delete / restore / hard delete ---
 app.delete('/api/posts/:id', requireAdmin, async (req, res) => {
   try {
     const id = req.params.id;
@@ -309,11 +304,7 @@ app.delete('/api/posts/:id', requireAdmin, async (req, res) => {
     const files = [`${base}.mp3`, `${base}.mp4`];
     const moved = [];
     for (const f of files) {
-      try {
-        await r2Copy(keyPosts(f), keyTrash(f));
-        await r2Delete(keyPosts(f));
-        moved.push(f);
-      } catch {}
+      try { await r2Copy(keyPosts(f), keyTrash(f)); await r2Delete(keyPosts(f)); moved.push(f); } catch {}
     }
     res.json({ ok: true, moved });
   } catch {
@@ -328,11 +319,7 @@ app.post('/api/posts/:id/restore', requireAdmin, async (req, res) => {
     const files = [`${base}.mp3`, `${base}.mp4`];
     const restored = [];
     for (const f of files) {
-      try {
-        await r2Copy(keyTrash(f), keyPosts(f));
-        await r2Delete(keyTrash(f));
-        restored.push(f);
-      } catch {}
+      try { await r2Copy(keyTrash(f), keyPosts(f)); await r2Delete(keyTrash(f)); restored.push(f); } catch {}
     }
     res.json({ ok: true, restored });
   } catch {
@@ -347,10 +334,7 @@ app.delete('/api/trash/:id', requireAdmin, async (req, res) => {
     const files = [`${base}.mp3`, `${base}.mp4`];
     const deleted = [];
     for (const f of files) {
-      try {
-        await r2Delete(keyTrash(f));
-        deleted.push(f);
-      } catch {}
+      try { await r2Delete(keyTrash(f)); deleted.push(f); } catch {}
     }
     res.json({ ok: true, deleted });
   } catch {
@@ -368,11 +352,7 @@ app.post('/api/posts/bulk-delete', requireAdmin, async (req, res) => {
       const files = [`${base}.mp3`, `${base}.mp4`];
       const moved = [];
       for (const f of files) {
-        try {
-          await r2Copy(keyPosts(f), keyTrash(f));
-          await r2Delete(keyPosts(f));
-          moved.push(f);
-        } catch {}
+        try { await r2Copy(keyPosts(f), keyTrash(f)); await r2Delete(keyPosts(f)); moved.push(f); } catch {}
       }
       results.push({ id: base, moved });
     }
@@ -391,11 +371,7 @@ app.post('/api/trash/bulk-restore', requireAdmin, async (req, res) => {
       const files = [`${base}.mp3`, `${base}.mp4`];
       const restored = [];
       for (const f of files) {
-        try {
-          await r2Copy(keyTrash(f), keyPosts(f));
-          await r2Delete(keyTrash(f));
-          restored.push(f);
-        } catch {}
+        try { await r2Copy(keyTrash(f), keyPosts(f)); await r2Delete(keyTrash(f)); restored.push(f); } catch {}
       }
       results.push({ id: base, restored });
     }
@@ -405,16 +381,14 @@ app.post('/api/trash/bulk-restore', requireAdmin, async (req, res) => {
   }
 });
 
-// --- Image upload to R2 (for Markdown embeds) ---
+// --- Image upload to R2 ---
 app.post('/api/images/upload', requireAdmin, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'missing image' });
     const ext = String(req.file.originalname.split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g, '') || 'png';
     const key = `images/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`;
     const url = await r2PutFile(req.file.path, key, req.file.mimetype || 'application/octet-stream');
-    try {
-      fs.unlinkSync(req.file.path);
-    } catch {}
+    try { fs.unlinkSync(req.file.path); } catch {}
     res.json({ ok: true, url, key });
   } catch (e) {
     console.error('image upload error', e);
