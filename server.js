@@ -500,7 +500,20 @@ app.delete('/api/posts/:id', requireAdmin, async (req, res) => {
         moved.push(`${id}.${ext}`);
       } catch {}
     }
-    if (moved.length === 0) return res.status(404).json({ error: 'not found' });
+    if (moved.length === 0) {
+      // No audio/video files were found.  This likely indicates a text/image
+      // post.  In this case we treat deletion as removing the metadata entry so
+      // the post disappears from the feed.  (There is no restore for such
+      // entries.)
+      const meta = await readMeta();
+      if (meta[id]) {
+        delete meta[id];
+        await writeMeta(meta);
+        return res.json({ ok: true, removedMeta: true });
+      }
+      // Nothing to delete
+      return res.status(404).json({ error: 'not found' });
+    }
     res.json({ ok: true, moved });
   } catch (err) {
     console.error('delete error', err);
