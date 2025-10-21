@@ -1,9 +1,7 @@
-FROM node:20-slim
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+FROM node:20
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci || npm install
+COPY package.json ./
+RUN npm install --package-lock-only || true && npm ci || npm install
 COPY . .
-ENV PORT=10000
 EXPOSE 10000
-CMD ["node", "server.js"]
+CMD ["node","server.js"]
