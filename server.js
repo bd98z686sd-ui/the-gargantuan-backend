@@ -258,11 +258,21 @@ app.get('/api/posts', async (req, res) => {
     const meta = await readMeta();
     const objects = await listObjects('posts/');
     // Exclude trash entries.
-    const filtered = objects.filter(o => !o.Key.startsWith('posts/.trash/'));
+    const filtered = objects.filter((o) => {
+      // Exclude objects in trash and the metadata file itself.  Without
+      // this filter the `_meta.json` file would be interpreted as a post
+      // entry on the homepage.
+      if (o.Key.startsWith('posts/.trash/')) return false;
+      const fileName = path.basename(o.Key);
+      if (fileName === '_meta.json') return false;
+      return true;
+    });
     // Group objects by base id.
     const groups = {};
     filtered.forEach((obj) => {
       const base = path.basename(obj.Key).replace(/\.[^/.]+$/, '');
+      // Skip any base names beginning with an underscore (e.g. _meta)
+      if (base.startsWith('_')) return;
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
@@ -280,10 +290,16 @@ app.get('/api/drafts', async (req, res) => {
   try {
     const meta = await readMeta();
     const objects = await listObjects('posts/');
-    const filtered = objects.filter(o => !o.Key.startsWith('posts/.trash/'));
+    const filtered = objects.filter((o) => {
+      if (o.Key.startsWith('posts/.trash/')) return false;
+      const fileName = path.basename(o.Key);
+      if (fileName === '_meta.json') return false;
+      return true;
+    });
     const groups = {};
     filtered.forEach((obj) => {
       const base = path.basename(obj.Key).replace(/\.[^/.]+$/, '');
+      if (base.startsWith('_')) return;
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
