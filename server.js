@@ -210,12 +210,23 @@ async function buildPost(id, objs, meta, includeDrafts = false, isTrash = false)
   if (!includeDrafts && metaEntry.draft) return undefined;
   const hasAudio = objs.some(o => /\.mp3$/i.test(o.Key));
   const hasVideo = objs.some(o => /\.mp4$/i.test(o.Key));
-  const audioUrl = hasAudio ? absoluteUrl(objs.find(o => /\.mp3$/i.test(o.Key)).Key) : '';
-  const videoUrl = hasVideo ? absoluteUrl(objs.find(o => /\.mp4$/i.test(o.Key)).Key) : '';
-  const date = objs.reduce((latest, o) => {
-    const t = o.LastModified ? new Date(o.LastModified) : new Date();
-    return !latest || t > latest ? t : latest;
+  const audioObj = objs.find(o => /\.mp3$/i.test(o.Key));
+  const videoObj = objs.find(o => /\.mp4$/i.test(o.Key));
+  const audioUrl = hasAudio ? absoluteUrl(audioObj.Key) : '';
+  const videoUrl = hasVideo ? absoluteUrl(videoObj.Key) : '';
+  // Determine the display date.  If we have object timestamps, use the most
+  // recent LastModified; otherwise fall back to the numeric id (which is
+  // derived from Date.now()) or the current time.
+  let latestDate = objs.reduce((latest, o) => {
+    const t = o.LastModified ? new Date(o.LastModified) : null;
+    return (!latest || (t && t > latest)) ? t : latest;
   }, null);
+  if (!latestDate) {
+    // Try to parse the id as a timestamp; if it fails use current time.
+    const ts = parseInt(id, 10);
+    if (!isNaN(ts)) latestDate = new Date(ts);
+    else latestDate = new Date();
+  }
   return {
     id,
     title: metaEntry.title || id,
@@ -226,7 +237,7 @@ async function buildPost(id, objs, meta, includeDrafts = false, isTrash = false)
     playUrl: videoUrl || audioUrl || '',
     audioUrl,
     videoUrl,
-    date: date ? date.toISOString() : new Date().toISOString(),
+    date: latestDate.toISOString(),
     _trash: isTrash,
   };
 }
@@ -276,8 +287,23 @@ app.get('/api/posts', async (req, res) => {
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
-    const posts = await Promise.all(Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, false, false)));
-    const list = posts.filter(Boolean).sort((a, b) => new Date(b.date) - new Date(a.date));
+    // Build posts for each group of objects (audio/video).
+    const postsFromObjects = await Promise.all(
+      Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, false, false))
+    );
+    const results = postsFromObjects.filter(Boolean);
+    // Include meta‑only posts: for each id in meta that does not have any
+    // audio/video objects we create a synthetic entry.  Skip entries that
+    // start with '_' (metadata keys) and drafts (handled by buildPost).
+    const objectIds = new Set(Object.keys(groups));
+    for (const id of Object.keys(meta)) {
+      if (objectIds.has(id)) continue;
+      if (id.startsWith('_')) continue;
+      const p = await buildPost(id, [], meta, false, false);
+      if (p) results.push(p);
+    }
+    // Sort newest first.
+    const list = results.sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json(list);
   } catch (err) {
     console.error('list posts error', err);
@@ -303,9 +329,20 @@ app.get('/api/drafts', async (req, res) => {
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
-    const posts = await Promise.all(Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, true, false)));
-    const drafts = posts.filter(p => p && p.draft).sort((a, b) => new Date(b.date) - new Date(a.date));
-    res.json(drafts);
+    // Build draft posts from objects (audio/video) and include meta‑only drafts.
+    const postsFromObjects = await Promise.all(
+      Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, true, false))
+    );
+    const results = postsFromObjects.filter(p => p && p.draft);
+    const objectIds = new Set(Object.keys(groups));
+    for (const id of Object.keys(meta)) {
+      if (objectIds.has(id)) continue;
+      if (id.startsWith('_')) continue;
+      const p = await buildPost(id, [], meta, true, false);
+      if (p && p.draft) results.push(p);
+    }
+    const draftsList = results.sort((a, b) => new Date(b.date) - new Date(a.date));
+    res.json(draftsList);
   } catch (err) {
     console.error('list drafts error', err);
     res.status(500).json({ error: 'Could not list drafts' });
