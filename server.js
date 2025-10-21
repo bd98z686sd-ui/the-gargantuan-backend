@@ -212,12 +212,24 @@ async function buildPost(id, objs, meta, includeDrafts = false, isTrash = false)
   const hasVideo = objs.some(o => /\.mp4$/i.test(o.Key));
   const audioUrl = hasAudio ? absoluteUrl(objs.find(o => /\.mp3$/i.test(o.Key)).Key) : '';
   const videoUrl = hasVideo ? absoluteUrl(objs.find(o => /\.mp4$/i.test(o.Key)).Key) : '';
-  let date = objs.reduce((latest, o) => {
-    const t = o.LastModified ? new Date(o.LastModified) : new Date();
-    return !latest || t > latest ? t : latest;
-  }, null);
-  // If no objects provided (e.g. text/image post), derive date from id when
-  // possible.  The id is a timestamp string (Date.now()), so parse it.
+  // Determine the date for this post.  If a date has been explicitly
+  // provided in the metadata (e.g. edited via the admin UI), use that.
+  let date;
+  if (metaEntry && metaEntry.date) {
+    const parsed = new Date(metaEntry.date);
+    if (!Number.isNaN(parsed)) {
+      date = parsed;
+    }
+  }
+  // Otherwise derive the latest LastModified timestamp from the R2 objects.
+  if (!date) {
+    date = objs.reduce((latest, o) => {
+      const t = o.LastModified ? new Date(o.LastModified) : new Date();
+      return !latest || t > latest ? t : latest;
+    }, null);
+  }
+  // If still no date (e.g. pure metadata post with no media), fall back to
+  // parsing the id (which is a millisecond timestamp) or use the current time.
   if (!date) {
     const ts = parseInt(id, 10);
     if (!Number.isNaN(ts)) date = new Date(ts);
@@ -489,6 +501,14 @@ app.patch('/api/posts/:id', requireAdmin, async (req, res) => {
     if (typeof fields.body === 'string') meta[id].body = fields.body;
     if (typeof fields.imageUrl === 'string') meta[id].imageUrl = fields.imageUrl;
     if (typeof fields.draft === 'boolean') meta[id].draft = fields.draft;
+    // Allow updating the date/time.  Accept an ISO string (from
+    // `datetime-local` input).  We do not validate the format here; the
+    // frontend should ensure a valid value.  When provided, this value
+    // overrides the automatic LastModified timestamp for pure metadata
+    // posts.
+    if (typeof fields.date === 'string' && fields.date) {
+      meta[id].date = fields.date;
+    }
     await writeMeta(meta);
     res.json({ ok: true, id });
   } catch (err) {
@@ -514,7 +534,17 @@ app.delete('/api/posts/:id', requireAdmin, async (req, res) => {
         moved.push(`${id}.${ext}`);
       } catch {}
     }
-    if (moved.length === 0) return res.status(404).json({ error: 'not found' });
+    // If no media files were moved then this may be a pure metadata (text/image)
+    // post.  In that case remove the metadata entry entirely and return OK.
+    if (moved.length === 0) {
+      const meta = await readMeta();
+      if (meta[id]) {
+        delete meta[id];
+        await writeMeta(meta);
+        return res.json({ ok: true, removedMeta: true });
+      }
+      return res.status(404).json({ error: 'not found' });
+    }
     res.json({ ok: true, moved });
   } catch (err) {
     console.error('delete error', err);
@@ -575,6 +605,9 @@ app.post('/api/posts/bulk-delete', requireAdmin, async (req, res) => {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
     if (!ids.length) return res.status(400).json({ error: 'ids required' });
     const results = [];
+    // Load metadata once; we'll remove entries for pure metadata posts.
+    const meta = await readMeta();
+    let metaChanged = false;
     for (const id of ids) {
       const exts = ['mp3', 'mp4'];
       const moved = [];
@@ -587,8 +620,15 @@ app.post('/api/posts/bulk-delete', requireAdmin, async (req, res) => {
           moved.push(`${id}.${ext}`);
         } catch {}
       }
-      results.push({ id, moved });
+      let removedMeta = false;
+      if (moved.length === 0 && meta[id]) {
+        delete meta[id];
+        metaChanged = true;
+        removedMeta = true;
+      }
+      results.push({ id, moved, removedMeta });
     }
+    if (metaChanged) await writeMeta(meta);
     res.json({ ok: true, results });
   } catch (err) {
     console.error('bulk delete error', err);
