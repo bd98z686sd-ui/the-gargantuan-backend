@@ -212,10 +212,17 @@ async function buildPost(id, objs, meta, includeDrafts = false, isTrash = false)
   const hasVideo = objs.some(o => /\.mp4$/i.test(o.Key));
   const audioUrl = hasAudio ? absoluteUrl(objs.find(o => /\.mp3$/i.test(o.Key)).Key) : '';
   const videoUrl = hasVideo ? absoluteUrl(objs.find(o => /\.mp4$/i.test(o.Key)).Key) : '';
-  const date = objs.reduce((latest, o) => {
+  let date = objs.reduce((latest, o) => {
     const t = o.LastModified ? new Date(o.LastModified) : new Date();
     return !latest || t > latest ? t : latest;
   }, null);
+  // If no objects provided (e.g. text/image post), derive date from id when
+  // possible.  The id is a timestamp string (Date.now()), so parse it.
+  if (!date) {
+    const ts = parseInt(id, 10);
+    if (!Number.isNaN(ts)) date = new Date(ts);
+    else date = new Date();
+  }
   return {
     id,
     title: metaEntry.title || id,
@@ -226,7 +233,7 @@ async function buildPost(id, objs, meta, includeDrafts = false, isTrash = false)
     playUrl: videoUrl || audioUrl || '',
     audioUrl,
     videoUrl,
-    date: date ? date.toISOString() : new Date().toISOString(),
+    date: date.toISOString(),
     _trash: isTrash,
   };
 }
@@ -266,7 +273,17 @@ app.get('/api/posts', async (req, res) => {
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
-    const posts = await Promise.all(Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, false, false)));
+    // Ensure that posts with only metadata (no media objects) are included.
+    Object.keys(meta).forEach((mid) => {
+      if (mid.startsWith('_')) return;
+      if (!groups[mid]) groups[mid] = [];
+    });
+    const posts = await Promise.all(Object.entries(groups).map(async ([id, objs]) => {
+      // Skip metadata entries (ids beginning with underscore) so that
+      // `posts/_meta.json` never appears as a post on the front page.
+      if (id.startsWith('_')) return undefined;
+      return await buildPost(id, objs, meta, false, false);
+    }));
     const list = posts.filter(Boolean).sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json(list);
   } catch (err) {
@@ -287,7 +304,14 @@ app.get('/api/drafts', async (req, res) => {
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
-    const posts = await Promise.all(Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, true, false)));
+    Object.keys(meta).forEach((mid) => {
+      if (mid.startsWith('_')) return;
+      if (!groups[mid]) groups[mid] = [];
+    });
+    const posts = await Promise.all(Object.entries(groups).map(async ([id, objs]) => {
+      if (id.startsWith('_')) return undefined;
+      return await buildPost(id, objs, meta, true, false);
+    }));
     const drafts = posts.filter(p => p && p.draft).sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json(drafts);
   } catch (err) {
@@ -309,7 +333,10 @@ app.get('/api/trash', requireAdmin, async (req, res) => {
       groups[base] = groups[base] || [];
       groups[base].push(obj);
     });
-    const posts = await Promise.all(Object.entries(groups).map(([id, objs]) => buildPost(id, objs, meta, true, true)));
+    const posts = await Promise.all(Object.entries(groups).map(async ([id, objs]) => {
+      if (id.startsWith('_')) return undefined;
+      return await buildPost(id, objs, meta, true, true);
+    }));
     const trash = posts.filter(Boolean).sort((a, b) => new Date(b.date) - new Date(a.date));
     res.json(trash);
   } catch (err) {
